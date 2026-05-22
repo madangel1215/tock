@@ -1463,6 +1463,7 @@ impl App {
                 self.date_changed();
             }
             "g" => self.go_to_date(),
+            "/" => self.search_events(),
             "n" => self.create_event(),
             "ENTER" => self.edit_event(),
             "x" | "DEL" => self.delete_event(),
@@ -2661,6 +2662,185 @@ impl App {
         Crust::clear_screen();
         self.recreate_panes();
         self.load_events_for_range();
+        self.render_all();
+    }
+
+    /// Spotlight-style live keyword search across events in ±2 year window.
+    /// `/` opens, type to narrow, ↑↓ pick, ENTER jumps to event's date, ESC cancels.
+    fn search_events(&mut self) {
+        let now = database::now_secs();
+        let two_years: i64 = 2 * 365 * 24 * 3600;
+        let events = match self.db.get_events_in_range(now - two_years, now + two_years) {
+            Ok(v) => v,
+            Err(_) => { self.show_feedback("Search failed", 196); return; }
+        };
+        if events.is_empty() {
+            self.show_feedback("No events in ±2 year window", 245);
+            return;
+        }
+
+        // Sort by distance from now (most relevant first).
+        let mut by_relevance: Vec<usize> = (0..events.len()).collect();
+        by_relevance.sort_by_key(|&i| (events[i].start_time - now).abs());
+
+        let pw = (self.cols.saturating_sub(8) as usize).min(90).max(60) as u16;
+        let ph = self.rows.saturating_sub(4).min(28);
+        let px = (self.cols.saturating_sub(pw)) / 2;
+        let py = (self.rows.saturating_sub(ph)) / 2;
+
+        let mut popup = Pane::new(px, py, pw, ph, 252, 0);
+        popup.border = true;
+        popup.scroll = false;
+
+        let mut query = String::new();
+        let mut sel = 0usize;
+        let tz = local_tz_offset_secs();
+
+        let filter = |q: &str, events: &[Event], by_relevance: &[usize]| -> Vec<usize> {
+            if q.is_empty() {
+                return by_relevance.iter().copied().collect();
+            }
+            let ql = q.to_lowercase();
+            by_relevance.iter().copied().filter(|&i| {
+                let e = &events[i];
+                if e.title.to_lowercase().contains(&ql) { return true; }
+                if let Some(ref l) = e.location {
+                    if l.to_lowercase().contains(&ql) { return true; }
+                }
+                if let Some(ref d) = e.description {
+                    if d.to_lowercase().contains(&ql) { return true; }
+                }
+                false
+            }).collect()
+        };
+
+        let render = |popup: &mut Pane, query: &str, results: &[usize], events: &[Event], sel: usize, pw: u16, ph: u16, tz: i64| {
+            popup.full_refresh();
+            let mut lines = Vec::new();
+            lines.push(String::new());
+            lines.push(format!("  / {}{}", query, style::fg("_", 51)));
+            let sep_w = (pw as usize).saturating_sub(6).max(1);
+            lines.push(format!("  {}", style::fg(&"-".repeat(sep_w), 238)));
+
+            let max_results = (ph as usize).saturating_sub(7);
+
+            if results.is_empty() {
+                lines.push(format!("  {}", style::fg("(no matches)", 245)));
+            } else {
+                for (idx, &ei) in results.iter().take(max_results).enumerate() {
+                    let e = &events[ei];
+                    let local_s = e.start_time + tz;
+                    let (y, m, d, sh, smn, _) = ts_to_parts(local_s);
+                    let when = if e.all_day {
+                        format!("{:04}-{:02}-{:02}      ", y, m, d)
+                    } else {
+                        format!("{:04}-{:02}-{:02} {:02}:{:02}", y, m, d, sh, smn)
+                    };
+                    let title = if e.title.is_empty() { "(no title)".to_string() } else { e.title.clone() };
+                    let title_trunc = truncate_str(&title, (pw as usize).saturating_sub(28));
+                    let color = e.calendar_color as u8;
+                    let swatch = style::fg("\u{2588}", color);
+                    // Selection visual: layered cues so it survives CJK (no bold
+                    // glyph) and varied terminals — bright marker + brighter
+                    // date + underline (terminal mode, not font weight).
+                    if idx == sel {
+                        let marker = style::fg(">", 51);
+                        let when_s = style::fg(&when, 252);
+                        let body = format!("{} {} {}  {}", marker, swatch, when_s, title_trunc);
+                        lines.push(format!("  {}", style::underline(&body)));
+                    } else {
+                        let when_s = style::fg(&when, 245);
+                        let body = format!("  {} {}  {}", swatch, when_s, title_trunc);
+                        lines.push(format!("  {}", body));
+                    }
+                }
+                if results.len() > max_results {
+                    lines.push(format!("  {}", style::fg(&format!("... +{} more (type to narrow)", results.len() - max_results), 245)));
+                }
+            }
+
+            while lines.len() < (ph as usize).saturating_sub(2) { lines.push(String::new()); }
+            let footer = format!("{} match{}  ·  UP/DOWN:nav  ENTER:jump  ESC:cancel",
+                results.len(), if results.len() == 1 { "" } else { "es" });
+            lines.push(format!("  {}", style::fg(&footer, 245)));
+            popup.set_text(&lines.join("\n"));
+            popup.ix = 0;
+            popup.refresh();
+        };
+
+        let mut results = filter(&query, &events, &by_relevance);
+        render(&mut popup, &query, &results, &events, sel, pw, ph, tz);
+
+        let mut jump_to: Option<usize> = None;
+
+        loop {
+            let k = Input::getchr(None);
+            match k.as_deref() {
+                Some("ESC") => break,
+                Some("RESIZE") => break,
+                Some("ENTER") => {
+                    if !results.is_empty() && sel < results.len() {
+                        jump_to = Some(results[sel]);
+                    }
+                    break;
+                }
+                Some("UP") => {
+                    if !results.is_empty() {
+                        let visible = results.len().min((ph as usize).saturating_sub(7));
+                        sel = if sel == 0 { visible - 1 } else { sel - 1 };
+                        render(&mut popup, &query, &results, &events, sel, pw, ph, tz);
+                    }
+                }
+                Some("DOWN") => {
+                    if !results.is_empty() {
+                        let visible = results.len().min((ph as usize).saturating_sub(7));
+                        sel = (sel + 1) % visible;
+                        render(&mut popup, &query, &results, &events, sel, pw, ph, tz);
+                    }
+                }
+                Some("BACK") => {
+                    if query.pop().is_some() {
+                        results = filter(&query, &events, &by_relevance);
+                        sel = 0;
+                        render(&mut popup, &query, &results, &events, sel, pw, ph, tz);
+                    }
+                }
+                Some(s) => {
+                    let chars: Vec<char> = s.chars().collect();
+                    if chars.len() == 1 && !chars[0].is_control() {
+                        query.push(chars[0]);
+                        results = filter(&query, &events, &by_relevance);
+                        sel = 0;
+                        render(&mut popup, &query, &results, &events, sel, pw, ph, tz);
+                    }
+                }
+                None => {}
+            }
+        }
+
+        Crust::clear_screen();
+        self.recreate_panes();
+
+        if let Some(ei) = jump_to {
+            let e = &events[ei];
+            let local_s = e.start_time + tz;
+            let (y, m, d, sh, smn, _) = ts_to_parts(local_s);
+            self.selected_date = (y, m, d);
+            // Snap cursor to event's slot AND scroll grid so it's actually
+            // visible. Without this, jumping to a 10:00 event while user was
+            // looking at the afternoon kept slot_offset stale → event sits
+            // above the visible window and looks like nothing happened.
+            if e.all_day {
+                self.selected_slot = -1;
+            } else {
+                let slot = (sh * 2 + if smn >= 30 { 1 } else { 0 }) as i32;
+                self.selected_slot = slot;
+                self.slot_offset = (slot - 5).max(0);
+            }
+            self.date_changed();
+        } else {
+            self.load_events_for_range();
+        }
         self.render_all();
     }
 
