@@ -1052,45 +1052,84 @@ impl App {
                 } else {
                     " ".repeat(time_col)
                 };
-                let mut parts = vec![label];
 
-                for col in 0..7 {
-                    let day = add_days(week_start, col);
-                    let is_sel = day == self.selected_date;
-                    let is_at = is_sel && is_row_selected;
-                    let cell_bg = if is_at { Some(slot_sel_bg) }
-                        else if is_sel { Some(sel_alt_a) }
-                        else { None };
+                // Identify "runs" of consecutive days sharing the same event id.
+                // A multi-day all-day event spans one continuous bar instead of
+                // repeating its title across every cell.
+                let mut runs: Vec<(usize, usize, Option<Event>)> = Vec::new();
+                let mut c = 0usize;
+                while c < 7 {
+                    let cur = week_allday[c].get(row).cloned();
+                    let mut end = c + 1;
+                    if let Some(ref e) = cur {
+                        while end < 7 {
+                            match week_allday[end].get(row) {
+                                Some(n) if n.id == e.id => end += 1,
+                                _ => break,
+                            }
+                        }
+                    }
+                    runs.push((c, end - c, cur));
+                    c = end;
+                }
 
-                    let evt_opt = week_allday[col as usize].get(row);
-                    let cell = if let Some(evt) = evt_opt {
-                        let title = if evt.title.is_empty() { "(No title)" } else { &evt.title };
-                        let color = evt.calendar_color as u8;
-                        let marker = if is_at { ">" } else { " " };
-                        let rsvp = rsvp_marker(evt.my_status.as_deref());
-                        let labeled = if rsvp.is_empty() { title.to_string() } else { format!("{} {}", rsvp, title) };
-                        let entry = format!("{}{}", marker, truncate_str(&labeled, day_col.saturating_sub(1)));
-                        if let Some(bg_c) = cell_bg {
-                            style::bg(&style::bold(&style::fg(&entry, color)), bg_c)
+                let mut row_str = label;
+                let runs_len = runs.len();
+                for (run_idx, (start, len, evt)) in runs.iter().enumerate() {
+                    let is_last = run_idx == runs_len - 1;
+                    // Run width: N cells × day_col + (N-1) inter-cell separators
+                    let run_w = *len * day_col + len.saturating_sub(1);
+
+                    let run_has_sel = (*start..(*start + *len)).any(|cc| {
+                        add_days(week_start, cc as i32) == self.selected_date
+                    });
+                    let run_bg = if run_has_sel && is_row_selected {
+                        Some(slot_sel_bg)
+                    } else if run_has_sel {
+                        Some(sel_alt_a)
+                    } else {
+                        None
+                    };
+
+                    let cell_text = if let Some(e) = evt {
+                        let title = if e.title.is_empty() { "(No title)" } else { &e.title };
+                        let color = e.calendar_color as u8;
+                        let marker = if run_has_sel && is_row_selected { ">" } else { " " };
+                        let rsvp = rsvp_marker(e.my_status.as_deref());
+                        let labeled = if rsvp.is_empty() {
+                            title.to_string()
+                        } else {
+                            format!("{} {}", rsvp, title)
+                        };
+                        let entry = format!("{}{}", marker, truncate_str(&labeled, run_w.saturating_sub(1)));
+                        let pure_len = display_width(&entry);
+                        let pad = run_w.saturating_sub(pure_len);
+                        let styled = if let Some(bg) = run_bg {
+                            style::bg(&style::bold(&style::fg(&entry, color)), bg)
                         } else {
                             style::fg(&entry, color)
-                        }
-                    } else if let Some(bg) = cell_bg {
-                        style::bg(" ", bg)
+                        };
+                        let pad_str = if let Some(bg) = run_bg {
+                            style::bg(&" ".repeat(pad), bg)
+                        } else {
+                            " ".repeat(pad)
+                        };
+                        format!("{}{}", styled, pad_str)
                     } else {
-                        " ".to_string()
+                        // Empty cell (always run length 1; we don't merge None).
+                        if let Some(bg) = run_bg {
+                            style::bg(&" ".repeat(day_col), bg)
+                        } else {
+                            " ".repeat(day_col)
+                        }
                     };
 
-                    let pure_len = display_width(&cell);
-                    let pad = day_col.saturating_sub(pure_len);
-                    let pad_str = if is_sel {
-                        style::bg(&" ".repeat(pad), sel_alt_a)
-                    } else {
-                        " ".repeat(pad)
-                    };
-                    parts.push(format!("{}{}", cell, pad_str));
+                    row_str.push_str(&cell_text);
+                    if !is_last {
+                        row_str.push(' ');
+                    }
                 }
-                lines.push(parts.join(" "));
+                lines.push(row_str);
             }
             lines.push(style::fg(&"-".repeat(self.cols as usize), 238));
         }
