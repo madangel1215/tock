@@ -791,7 +791,7 @@ impl App {
     // ----- Status bar -----
 
     fn render_status_bar(&mut self) {
-        let keys = "d/D:Day  w/W:Week  m/M:Month  y/Y:Year  e/E:Event  n:New  g:GoTo  t:Today  i:Import  G:Google  O:Outlook  S:Sync  C:Cal  P:Prefs  ?:Help  q:Quit";
+        let keys = "d/D:Day  w/W:Week  m/M:Month  y/Y:Year  e/E:Event  J:Join  N:Note  n:New  g:GoTo  t:Today  i:Import  G:Google  O:Outlook  S:Sync  C:Cal  P:Prefs  ?:Help  q:Quit";
         let version = format!("tock v{}", env!("CARGO_PKG_VERSION"));
         let w = self.cols as usize;
         if self.syncing {
@@ -1474,6 +1474,7 @@ impl App {
             "T" => self.tentative_invite(),
             "F" => self.show_free_busy(),
             "J" => self.join_meeting(),
+            "N" => self.open_meeting_note(),
             "r" => self.reply_via_kastrup(),
             "i" => self.import_ics_file(),
             "G" => self.setup_google_calendar(),
@@ -2370,6 +2371,30 @@ impl App {
             Ok(_) => {}  // already showed the fallback note above
             Err(e) => self.show_feedback(
                 &format!("Couldn't launch {}: {}", launcher, e), 196),
+        }
+    }
+
+    /// `N` (Note) — open an Obsidian meeting note for the selected event.
+    ///
+    /// Shells out to `obsidian-note-open <event_id>`, which is responsible
+    /// for: querying tock.db, generating a deterministic filename, creating
+    /// the markdown from a template if absent, and launching the file via
+    /// `open obsidian://…`. Detached spawn so tock stays in the foreground.
+    fn open_meeting_note(&mut self) {
+        let evt = match self.event_at_selected_slot() {
+            Some(e) => e,
+            None => { self.show_feedback("No event at this time slot", 245); return; }
+        };
+        let spawned = std::process::Command::new("obsidian-note-open")
+            .arg(evt.id.to_string())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        match spawned {
+            Ok(_) => self.show_feedback(&format!("Opening note: {}", evt.title), 156),
+            Err(e) => self.show_feedback(
+                &format!("obsidian-note-open failed: {}", e), 196),
         }
     }
 
