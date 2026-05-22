@@ -2553,7 +2553,7 @@ impl App {
             }
 
             lines.push(String::new());
-            lines.push(format!("  {}", style::fg("j/k:nav  c:color  ENTER:toggle  x:remove  q:close", 245)));
+            lines.push(format!("  {}", style::fg("j/k:nav  o:only  a:all  c:color  ENTER:toggle  x:remove  q:close", 245)));
             popup.set_text(&lines.join("\n"));
             popup.ix = 0;
             popup.refresh();
@@ -2598,6 +2598,39 @@ impl App {
                         calendars.remove(sel);
                         if calendars.is_empty() { break; }
                         if sel >= calendars.len() { sel = calendars.len() - 1; }
+                    }
+                    build(&calendars, sel, &mut popup, pw);
+                }
+                Some("o") => {
+                    // Solo: enable only the selected calendar. If it's already
+                    // the sole enabled one, restore all to enabled (un-solo).
+                    let enabled_count = calendars.iter().filter(|c| c.enabled).count();
+                    let already_solo = enabled_count == 1 && calendars[sel].enabled;
+                    if already_solo {
+                        for cal in calendars.iter_mut() {
+                            if !cal.enabled {
+                                let _ = self.db.toggle_calendar_enabled(cal.id);
+                                cal.enabled = true;
+                            }
+                        }
+                    } else {
+                        for (i, cal) in calendars.iter_mut().enumerate() {
+                            let want = i == sel;
+                            if cal.enabled != want {
+                                let _ = self.db.toggle_calendar_enabled(cal.id);
+                                cal.enabled = want;
+                            }
+                        }
+                    }
+                    build(&calendars, sel, &mut popup, pw);
+                }
+                Some("a") => {
+                    // Enable all calendars
+                    for cal in calendars.iter_mut() {
+                        if !cal.enabled {
+                            let _ = self.db.toggle_calendar_enabled(cal.id);
+                            cal.enabled = true;
+                        }
                     }
                     build(&calendars, sel, &mut popup, pw);
                 }
