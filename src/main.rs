@@ -1146,7 +1146,24 @@ impl App {
         // Time grid
         let _work_start = self.config.get_i64("work_hours.start", 8) as i32;
         let extra_rows = if max_allday > 0 { max_allday + 1 } else { 0 };
-        let available = (self.mid.h as i32 - 3 - extra_rows as i32).max(1);
+
+        // "Now line" — a horizontal indicator showing the current time
+        // across the week grid. The day header already highlights today,
+        // so we don't need a dot — a clean dash row with the time
+        // right-aligned is enough. Only drawn when today is in the
+        // visible week. Costs one row of vertical space; budget for it
+        // up-front to avoid clipping.
+        let today_in_view = (0..7).any(|c| add_days(week_start, c) == t);
+        let now_secs_into_today = {
+            let today_midnight_utc = date_to_ts(t.0, t.1, t.2, 0, 0, 0) - tz;
+            (crate::database::now_secs() - today_midnight_utc).max(0)
+        };
+        let now_slot_idx = (now_secs_into_today / 1800) as i32;
+        let now_hh = (now_secs_into_today / 3600) as i32;
+        let now_mm = ((now_secs_into_today % 3600) / 60) as i32;
+        let now_line_reserve = if today_in_view { 1 } else { 0 };
+
+        let available = (self.mid.h as i32 - 3 - extra_rows as i32 - now_line_reserve).max(1);
 
         // Default offset
         if self.slot_offset < 0 { self.slot_offset = 0; }
@@ -1265,6 +1282,20 @@ impl App {
                 parts.push(format!("{}{}", cell, style::bg(&" ".repeat(pad), cell_bg)));
             }
             lines.push(parts.join(" "));
+
+            // Push the "now line" right after the slot containing the
+            // current time. Clean dashes across the full pane width with
+            // the time right-aligned — the left gutter is dashes too so
+            // there's no slot-label-looking text on this row.
+            if today_in_view && slot_idx == now_slot_idx {
+                let total_w = self.cols as usize;
+                let label = format!(" {:02}:{:02}", now_hh, now_mm); // 6 cells incl. leading space
+                let label_w = display_width(&label);
+                let dashes_w = total_w.saturating_sub(label_w);
+                let dashes: String = "─".repeat(dashes_w);
+                let raw = format!("{}{}", dashes, label);
+                lines.push(style::fg(&raw, 196u8));
+            }
         }
 
         while lines.len() < self.mid.h as usize {
