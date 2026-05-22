@@ -705,7 +705,16 @@ impl App {
     fn render_info_bar(&mut self) {
         let (sy, sm, sd) = self.selected_date;
         let title = style::bold(" Tock");
-        let date_str = format!("  {}", format_date_long(sy, sm, sd));
+        // tock-event-counter: show count of events on selected day in header.
+        let event_count = self.events_on_selected_day().len();
+        let date_str = if event_count > 0 {
+            format!("  {}  ·  {} event{}",
+                format_date_long(sy, sm, sd),
+                event_count,
+                if event_count == 1 { "" } else { "s" })
+        } else {
+            format!("  {}", format_date_long(sy, sm, sd))
+        };
 
         let phase = orbit::moon_phase(sy, sm, sd);
         let moon_color = body_color("moon");
@@ -1285,16 +1294,25 @@ impl App {
             let title = if rsvp.is_empty() { title_only } else { format!("{} {}", rsvp, title_only) };
             let tz = local_tz_offset_secs();
 
+            // tock-event-counter: show current event's position in the day's
+            // event list, e.g. "[3/5]". Suppressed when there's only 1 event.
+            let total_events = events.len();
+            let position = events.iter().position(|e| e.id == evt.id).map(|i| i + 1);
+            let counter = match position {
+                Some(p) if total_events > 1 => format!("  [{}/{}]", p, total_events),
+                _ => String::new(),
+            };
+
             let time_info = if evt.all_day {
-                format!("{}-{:02}-{:02}  All day", sy, sm, sd)
+                format!("{}-{:02}-{:02}  All day{}", sy, sm, sd, counter)
             } else {
                 let local_s = evt.start_time + tz;
                 let (_, _, _, sh, smn, _) = ts_to_parts(local_s);
                 let local_e = evt.end_time + tz;
                 let (_, _, _, eh, emn, _) = ts_to_parts(local_e);
                 let swd = cwday(sy, sm, sd);
-                format!("{} {}-{:02}-{:02}  {:02}:{:02} - {:02}:{:02}",
-                    weekday_short(swd), sy, sm, sd, sh, smn, eh, emn)
+                format!("{} {}-{:02}-{:02}  {:02}:{:02} - {:02}:{:02}{}",
+                    weekday_short(swd), sy, sm, sd, sh, smn, eh, emn, counter)
             };
 
             lines.push(format!(" {}  {}",
