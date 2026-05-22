@@ -806,8 +806,10 @@ impl App {
         let (sy, sm, sd) = self.selected_date;
         let t = today();
         let month_width = 26usize; // 25 + 1 separator
-        let months_visible = (self.cols as usize / month_width).max(1);
-        let offset = 3; // Selected month is 4th from left
+        // Show only prev/current/next month (3 strips). Subtract to make
+        // negative space — Boris-style: don't display info you never use.
+        let months_visible = 3usize;
+        let offset = 1; // Selected (current) month is 2nd, prev=1st, next=3rd
 
         let mut month_data: Vec<(i32, u32)> = Vec::new();
         for i in 0..months_visible {
