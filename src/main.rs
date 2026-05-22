@@ -1181,7 +1181,6 @@ impl App {
 
                 let cell = if let Some(evt) = evt_opt {
                     let is_at_slot = is_sel && is_slot_selected;
-                    let marker = if is_at_slot { ">" } else { " " };
                     let color = evt.calendar_color as u8;
                     // The title only renders in ONE row per event:
                     // either the slot where the event starts (so a
@@ -1199,6 +1198,12 @@ impl App {
                     let ends_here = evt.end_time > day_ts_start && evt.end_time <= day_ts_end;
 
                     if show_title {
+                        // New design (Notion / Linear style):
+                        //   `▌` left-edge bar in the event's color,
+                        //   followed by the title in **bold bright text**.
+                        //   The colored bar carries the calendar identity;
+                        //   the title text is white for max readability.
+                        //   When the slot is selected, prepend `>` marker.
                         let title = if evt.title.is_empty() { "(No title)" } else { &evt.title };
                         let rsvp = rsvp_marker(evt.my_status.as_deref());
                         let labeled = if rsvp.is_empty() {
@@ -1206,29 +1211,26 @@ impl App {
                         } else {
                             format!("{} {}", rsvp, title)
                         };
-                        let mut entry = format!("{}{}", marker, labeled);
-                        if entry.len() > day_col {
-                            entry = format!("{}.", truncate_str(&entry, day_col.saturating_sub(1)));
-                        }
-                        if is_at_slot {
-                            style::bg(&style::bold(&style::fg(&entry, color)), cell_bg)
-                        } else {
-                            style::bg(&style::fg(&entry, color), cell_bg)
-                        }
+                        let prefix = if is_at_slot { ">" } else { " " };
+                        // Reserve 3 cells for: prefix + bar + space.
+                        let title_max = day_col.saturating_sub(3);
+                        let title_trunc = truncate_str(&labeled, title_max);
+                        let bar = style::fg("\u{258C}", color); // ▌ LEFT HALF BLOCK
+                        let title_styled = style::bold(&style::fg(&title_trunc, 255));
+                        let entry = format!("{}{} {}", prefix, bar, title_styled);
+                        style::bg(&entry, cell_bg)
                     } else {
-                        // Continuation row. `▕` (U+2595 RIGHT ONE
-                        // EIGHTH BLOCK) draws a single thin bar on
-                        // the left edge in the event's colour; the
-                        // rest of the cell stays on the slot bg so
-                        // it reads as quiet continuation rather than
-                        // a heavy block. The last slot of a multi-
-                        // slot event additionally prints the end
-                        // time (e.g. "▕ -15:30") so the GM knows
-                        // exactly where it stops without scrolling.
+                        // Continuation row. Use `▎` (U+258E LEFT ONE
+                        // QUARTER BLOCK) — a thinner bar at the same
+                        // LEFT edge as the title row's `▌` so the
+                        // span reads as one continuous visual line.
+                        // The last slot of a multi-slot event prints
+                        // the end time (e.g. "▎ -15:30") so the user
+                        // knows exactly where it stops.
                         let bar = if is_at_slot {
-                            style::bold(&style::fg("\u{2595}", color))
+                            style::bold(&style::fg("\u{258E}", color))
                         } else {
-                            style::fg("\u{2595}", color)
+                            style::fg("\u{258E}", color)
                         };
                         let tail = if ends_here {
                             let end_local = evt.end_time + tz;
