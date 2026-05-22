@@ -119,7 +119,8 @@ fn run_sync_cycle(db: &Database) -> bool {
 
     let mut any_new = false;
 
-    // 90-day window around today.
+    // Window for window-based sources (Outlook). Google no longer uses a fixed
+    // window — it does incremental syncToken sync (see sync_google_calendar).
     let now = now_secs();
     let range_start = now - 90 * 86400;
     let range_end = now + 90 * 86400;
@@ -127,7 +128,7 @@ fn run_sync_cycle(db: &Database) -> bool {
     for cal in &calendars {
         match cal.source_type.as_str() {
             "google" => {
-                if sync_google_calendar(db, cal, range_start, range_end) {
+                if sync_google_calendar(db, cal) {
                     any_new = true;
                 }
             }
@@ -151,8 +152,6 @@ fn run_sync_cycle(db: &Database) -> bool {
 fn sync_google_calendar(
     db: &Database,
     cal: &crate::database::Calendar,
-    range_start: i64,
-    range_end: i64,
 ) -> bool {
     use crate::sources::google::GoogleCalendar;
 
@@ -180,18 +179,48 @@ fn sync_google_calendar(
         return false;
     }
 
-    let time_min = ts_to_rfc3339(range_start);
-    let time_max = ts_to_rfc3339(range_end);
+    // Full-sync history floor: 2 years back. Future is unbounded (no timeMax),
+    // so far-out events sync regardless of how packed the schedule is.
+    let now = now_secs();
+    let floor_ts = now - 730 * 86400;
+    let floor = ts_to_rfc3339(floor_ts);
 
-    let events = match gc.fetch_events(google_calendar_id, &time_min, &time_max) {
-        Some(evts) => evts,
-        None => return false,
+    let token = cal.sync_token.clone();
+    let had_token = token.is_some();
+
+    // Incremental if we have a token; full sync otherwise.
+    let mut fetch = gc.fetch_events_synced(google_calendar_id, token.as_deref(), &floor);
+
+    // Token rejected (HTTP 410): discard it and do a full resync.
+    let did_full = if fetch.expired {
+        fetch = gc.fetch_events_synced(google_calendar_id, None, &floor);
+        true
+    } else {
+        !had_token
     };
 
-    let mut any_new = reconcile_deletions(db, cal.id, &events, range_start, range_end);
+    let mut any_new = false;
 
-    for mut ev in events {
+    // A full pass (first sync / after 410) does not report deletions, so prune
+    // local events in [floor, far future] that the upstream no longer returns.
+    // Incremental passes carry deletions natively (status == "cancelled").
+    if did_full {
+        let far = now + 36500 * 86400;
+        if reconcile_deletions(db, cal.id, &fetch.events, floor_ts, far) {
+            any_new = true;
+        }
+    }
+
+    for mut ev in fetch.events {
         ev.calendar_id = cal.id;
+        if ev.status == "cancelled" {
+            if let Some(ref xid) = ev.external_id {
+                if db.delete_event_by_external_id(cal.id, xid).is_ok() {
+                    any_new = true;
+                }
+            }
+            continue;
+        }
         match db.upsert_synced_event(cal.id, &ev) {
             Ok(SyncResult::New) => any_new = true,
             Ok(SyncResult::Updated) => any_new = true,
@@ -199,7 +228,17 @@ fn sync_google_calendar(
         }
     }
 
-    let _ = db.update_calendar_sync(cal.id, now_secs(), None);
+    // Persist the new sync token when we got one; otherwise just bump the
+    // last-synced timestamp (keeps any existing token intact on errors).
+    match fetch.next_sync_token {
+        Some(tok) => {
+            let _ = db.update_calendar_sync_token(cal.id, &tok, now_secs());
+        }
+        None => {
+            let _ = db.update_calendar_sync(cal.id, now_secs(), None);
+        }
+    }
+
     any_new
 }
 

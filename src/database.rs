@@ -526,6 +526,23 @@ impl Database {
         Ok(())
     }
 
+    /// Persist the incremental-sync token (Google `nextSyncToken`) for a
+    /// calendar plus the last-synced timestamp. Used by syncToken-based Google
+    /// sync so the next poll only fetches changes since this token.
+    pub fn update_calendar_sync_token(
+        &self,
+        id: i64,
+        sync_token: &str,
+        last_synced_at: i64,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE calendars SET sync_token = ?1, last_synced_at = ?2 WHERE id = ?3",
+            params![sync_token, last_synced_at, id],
+        )?;
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Settings
     // -----------------------------------------------------------------------

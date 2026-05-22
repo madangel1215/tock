@@ -29,6 +29,27 @@ pub struct GoogleCalendar {
     pub last_error: Option<String>,
 }
 
+/// Result of one incremental (`syncToken`) sync pass.
+pub struct SyncFetch {
+    /// Events returned this pass. In incremental mode this includes deletions
+    /// (items with `status == "cancelled"`); in a full pass only live events.
+    pub events: Vec<EventData>,
+    /// The `nextSyncToken` to store for the next incremental pass (only present
+    /// once the final page is reached without error).
+    pub next_sync_token: Option<String>,
+    /// True if the supplied sync token was rejected with HTTP 410 (expired) and
+    /// the caller must do a full resync.
+    pub expired: bool,
+}
+
+/// Outcome of a single authenticated GET, distinguishing the 410 (Gone) case
+/// used to detect an expired sync token.
+enum GetResult {
+    Ok(Value),
+    Gone,
+    Failed,
+}
+
 // ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
@@ -248,6 +269,90 @@ impl GoogleCalendar {
         Some(all_events)
     }
 
+    /// Incremental sync via Google's `syncToken`.
+    ///
+    /// - If `sync_token` is `Some`, fetch only changes since that token. Google
+    ///   returns deletions as items with `status == "cancelled"`. syncToken mode
+    ///   forbids `timeMin`/`timeMax`/`orderBy`, so they are omitted.
+    /// - If `sync_token` is `None`, do a full sync from `full_floor` (RFC3339
+    ///   `timeMin`) with no upper bound — i.e. everything from the floor into the
+    ///   unbounded future.
+    ///
+    /// Pagination uses `pageToken`; the `nextSyncToken` is only present on the
+    /// final page. HTTP 410 on the token sets `expired = true`.
+    pub fn fetch_events_synced(
+        &mut self,
+        calendar_id: &str,
+        sync_token: Option<&str>,
+        full_floor: &str,
+    ) -> SyncFetch {
+        let mut all_events: Vec<EventData> = Vec::new();
+        let mut page_token: Option<String> = None;
+        let mut next_sync_token: Option<String> = None;
+
+        loop {
+            let mut path = format!(
+                "/calendar/v3/calendars/{}/events?singleEvents=true&maxResults=250",
+                url_encode(calendar_id),
+            );
+            if let Some(ref pt) = page_token {
+                // Continuation page: carry pageToken. In full mode the original
+                // query params (timeMin) must be repeated; in syncToken mode the
+                // token is replaced by the pageToken (no syncToken on this page).
+                path.push_str(&format!("&pageToken={}", url_encode(pt)));
+                if sync_token.is_none() {
+                    path.push_str(&format!("&timeMin={}", url_encode(full_floor)));
+                }
+            } else if let Some(tok) = sync_token {
+                path.push_str(&format!("&syncToken={}", url_encode(tok)));
+            } else {
+                path.push_str(&format!("&timeMin={}", url_encode(full_floor)));
+            }
+
+            match self.api_get_checked(&path) {
+                GetResult::Ok(json) => {
+                    if let Some(items) = json.get("items").and_then(Value::as_array) {
+                        for item in items {
+                            all_events.push(normalize_event(item, &self.email));
+                        }
+                    }
+                    if let Some(t) = json.get("nextSyncToken").and_then(Value::as_str) {
+                        next_sync_token = Some(t.to_string());
+                    }
+                    page_token = json
+                        .get("nextPageToken")
+                        .and_then(Value::as_str)
+                        .map(String::from);
+                    if page_token.is_none() {
+                        break;
+                    }
+                }
+                GetResult::Gone => {
+                    return SyncFetch {
+                        events: Vec::new(),
+                        next_sync_token: None,
+                        expired: true,
+                    };
+                }
+                GetResult::Failed => {
+                    // Network/other error: return what we have without advancing
+                    // the token, so the caller keeps the existing token.
+                    return SyncFetch {
+                        events: all_events,
+                        next_sync_token: None,
+                        expired: false,
+                    };
+                }
+            }
+        }
+
+        SyncFetch {
+            events: all_events,
+            next_sync_token,
+            expired: false,
+        }
+    }
+
     pub fn create_event(
         &mut self,
         calendar_id: &str,
@@ -385,6 +490,47 @@ impl GoogleCalendar {
             Err(e) => {
                 self.last_error = Some(format!("GET {} failed: {}", url, e));
                 None
+            }
+        }
+    }
+
+    /// Like `api_get` but distinguishes HTTP 410 (Gone) — used by incremental
+    /// sync to detect an expired `syncToken` and trigger a full resync.
+    fn api_get_checked(&mut self, path: &str) -> GetResult {
+        let token = match self.get_access_token() {
+            Some(t) => t,
+            None => return GetResult::Failed,
+        };
+        let url = if path.starts_with("http") {
+            path.to_string()
+        } else {
+            format!("https://www.googleapis.com{}", path)
+        };
+
+        let resp = ureq::get(&url)
+            .set("Authorization", &format!("Bearer {}", token))
+            .set("Accept-Encoding", "identity")
+            .timeout(std::time::Duration::from_secs(60))
+            .call();
+
+        match resp {
+            Ok(r) => match r.into_json::<Value>() {
+                Ok(v) => {
+                    self.last_error = None;
+                    GetResult::Ok(v)
+                }
+                Err(e) => {
+                    self.last_error = Some(format!("JSON parse error: {}", e));
+                    GetResult::Failed
+                }
+            },
+            Err(ureq::Error::Status(410, _)) => {
+                self.last_error = Some("Sync token expired (HTTP 410)".into());
+                GetResult::Gone
+            }
+            Err(e) => {
+                self.last_error = Some(format!("GET {} failed: {}", url, e));
+                GetResult::Failed
             }
         }
     }
