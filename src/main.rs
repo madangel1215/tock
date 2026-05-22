@@ -1527,6 +1527,11 @@ impl App {
             "P" => self.show_preferences(),
             "?" => self.show_help(),
             "q" => self.running = false,
+            "RESIZE" => {
+                Crust::clear_screen();
+                self.recreate_panes();
+                self.render_all();
+            }
             _ => {}
         }
     }
