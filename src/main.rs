@@ -1208,71 +1208,79 @@ impl App {
                 let cell = if let Some(evt) = evt_opt {
                     let is_at_slot = is_sel && is_slot_selected;
                     let color = evt.calendar_color as u8;
-                    // The title only renders in ONE row per event:
-                    // either the slot where the event starts (so a
-                    // 09:00 event lands on row 09:00), or — when the
-                    // event began before the visible window — at the
-                    // top of the visible scroll so the user always
-                    // sees the name once. Continuation slots show a
-                    // thin left-edge bar in the calendar's colour so
-                    // the span is still obvious without the title
-                    // being printed 13 times.
-                    let starts_here = evt.start_time >= day_ts_start && evt.start_time < day_ts_end;
-                    let is_first_visible = slot_idx == self.slot_offset
-                        && evt.start_time < day_ts_start;
-                    let show_title = starts_here || is_first_visible;
-                    let ends_here = evt.end_time > day_ts_start && evt.end_time <= day_ts_end;
+                    // Multi-row title wrap (option 🅔): instead of printing
+                    // the title once and leaving the continuation rows as
+                    // single-bar empty rows, wrap the title across all rows
+                    // the event actually occupies. End time `-HH:MM` lives
+                    // on the bottom row, right-aligned. Every row uses the
+                    // same `▌` bar so the column reads as one solid block.
+                    let day_midnight_ts = date_to_ts(day.0, day.1, day.2, 0, 0, 0) - tz;
+                    let event_first_slot = ((evt.start_time - day_midnight_ts).max(0) / 1800) as i32;
+                    // -1 because end_time is exclusive; an event ending at
+                    // 17:00 finishes IN slot 33 (16:30-17:00), not slot 34.
+                    let event_last_slot = (((evt.end_time - 1) - day_midnight_ts).max(0) / 1800) as i32;
+                    let visible_first = event_first_slot.max(self.slot_offset);
+                    let visible_last = event_last_slot.min(end_slot - 1);
+                    let current_event_row = (slot_idx - visible_first).max(0) as usize;
+                    let is_last_row = slot_idx == visible_last;
+                    let ends_in_view = evt.end_time > day_ts_start
+                        && evt.end_time <= (day_midnight_ts + (end_slot as i64) * 1800);
 
-                    if show_title {
-                        // New design (Notion / Linear style):
-                        //   `▌` left-edge bar in the event's color,
-                        //   followed by the title in **bold bright text**.
-                        //   The colored bar carries the calendar identity;
-                        //   the title text is white for max readability.
-                        //   When the slot is selected, prepend `>` marker.
-                        let title = if evt.title.is_empty() { "(No title)" } else { &evt.title };
-                        let rsvp = rsvp_marker(evt.my_status.as_deref());
-                        let labeled = if rsvp.is_empty() {
-                            title.to_string()
-                        } else {
-                            format!("{} {}", rsvp, title)
-                        };
-                        let prefix = if is_at_slot { ">" } else { " " };
-                        // Reserve 3 cells for: prefix + bar + space.
-                        let title_max = day_col.saturating_sub(3);
-                        let title_trunc = truncate_str(&labeled, title_max);
-                        let bar = style::fg("\u{258C}", color); // ▌ LEFT HALF BLOCK
-                        let title_styled = style::bold(&style::fg(&title_trunc, 255));
-                        let entry = format!("{}{} {}", prefix, bar, title_styled);
-                        style::bg(&entry, cell_bg)
+                    // Title text (cached construction across rows).
+                    let title = if evt.title.is_empty() { "(No title)" } else { &evt.title };
+                    let rsvp = rsvp_marker(evt.my_status.as_deref());
+                    let labeled = if rsvp.is_empty() {
+                        title.to_string()
                     } else {
-                        // Continuation row. Use `▎` (U+258E LEFT ONE
-                        // QUARTER BLOCK) — a thinner bar at the same
-                        // LEFT edge as the title row's `▌` so the
-                        // span reads as one continuous visual line.
-                        // The last slot of a multi-slot event prints
-                        // the end time (e.g. "▎ -15:30") so the user
-                        // knows exactly where it stops.
-                        let bar = if is_at_slot {
-                            style::bold(&style::fg("\u{258E}", color))
-                        } else {
-                            style::fg("\u{258E}", color)
-                        };
-                        let tail = if ends_here {
-                            let end_local = evt.end_time + tz;
-                            let hh = ((end_local.rem_euclid(86400)) / 3600) as i32;
-                            let mm = ((end_local.rem_euclid(3600)) / 60) as i32;
-                            format!(" -{:02}:{:02}", hh, mm)
-                        } else {
-                            String::new()
-                        };
-                        let tail_styled = if tail.is_empty() {
-                            String::new()
-                        } else {
-                            style::fg(&tail, color)
-                        };
-                        style::bg(&format!("{}{}", bar, tail_styled), cell_bg)
-                    }
+                        format!("{} {}", rsvp, title)
+                    };
+
+                    // End-time tail only on bottom row, only if the event
+                    // actually ends within our viewport.
+                    let tail = if is_last_row && ends_in_view {
+                        let end_local = evt.end_time + tz;
+                        let hh = ((end_local.rem_euclid(86400)) / 3600) as i32;
+                        let mm = ((end_local.rem_euclid(3600)) / 60) as i32;
+                        format!(" -{:02}:{:02}", hh, mm)
+                    } else {
+                        String::new()
+                    };
+                    let tail_w = display_width(&tail);
+
+                    // Per-row title width budget. Layout per row:
+                    //   prefix(1) + bar(1) + space(1) + title + pad + tail
+                    let row_w = day_col.saturating_sub(3); // base budget per row
+                    let title_max_w = if is_last_row {
+                        row_w.saturating_sub(tail_w)
+                    } else {
+                        row_w
+                    };
+                    let start_w = current_event_row * row_w;
+                    let title_slice = slice_by_display(&labeled, start_w, title_max_w);
+                    let title_w = display_width(&title_slice);
+
+                    let prefix = if is_at_slot { ">" } else { " " };
+                    let bar = style::fg("\u{258C}", color); // ▌
+                    let title_styled = if title_slice.is_empty() {
+                        String::new()
+                    } else {
+                        style::bold(&style::fg(&title_slice, 255))
+                    };
+                    let tail_styled = if tail.is_empty() {
+                        String::new()
+                    } else {
+                        style::fg(&tail, color)
+                    };
+                    // 3 cells overhead (prefix + bar + space).
+                    let used_w = 3 + title_w + tail_w;
+                    let pad = day_col.saturating_sub(used_w);
+                    let pad_str = if pad > 0 {
+                        style::bg(&" ".repeat(pad), cell_bg)
+                    } else {
+                        String::new()
+                    };
+                    let entry = format!("{}{} {}{}{}", prefix, bar, title_styled, pad_str, tail_styled);
+                    style::bg(&entry, cell_bg)
                 } else {
                     style::bg(" ", cell_bg)
                 };
@@ -3261,6 +3269,46 @@ fn day_diff(a: (i32, u32, u32), b: (i32, u32, u32)) -> i64 {
 fn truncate_str(s: &str, max: usize) -> String {
     if s.len() <= max { s.to_string() }
     else { s.chars().take(max).collect() }
+}
+
+/// Display width of a single char in terminal cells. East Asian wide /
+/// fullwidth ranges count as 2, everything else as 1. Approximation but
+/// covers the CJK / fullwidth ranges that matter for tock users.
+fn char_display_width(c: char) -> usize {
+    let cu = c as u32;
+    if (0x1100..=0x115F).contains(&cu)
+        || (0x2E80..=0x303E).contains(&cu)
+        || (0x3041..=0x33FF).contains(&cu)
+        || (0x3400..=0x4DBF).contains(&cu)
+        || (0x4E00..=0x9FFF).contains(&cu)
+        || (0xA000..=0xA4CF).contains(&cu)
+        || (0xAC00..=0xD7A3).contains(&cu)
+        || (0xF900..=0xFAFF).contains(&cu)
+        || (0xFE30..=0xFE4F).contains(&cu)
+        || (0xFF00..=0xFF60).contains(&cu)
+        || (0xFFE0..=0xFFE6).contains(&cu)
+        || (0x20000..=0x2FFFD).contains(&cu)
+        || (0x30000..=0x3FFFD).contains(&cu)
+    { 2 } else { 1 }
+}
+
+/// Slice `s` by terminal display width: skip `start_w` cells, then emit up
+/// to `max_w` cells worth of characters. Used for wrapping long titles
+/// across the rows that an event already occupies in the time grid.
+fn slice_by_display(s: &str, start_w: usize, max_w: usize) -> String {
+    let mut consumed = 0usize;
+    let mut emitted = 0usize;
+    let mut result = String::new();
+    for c in s.chars() {
+        let cw = char_display_width(c);
+        if consumed >= start_w {
+            if emitted + cw > max_w { break; }
+            result.push(c);
+            emitted += cw;
+        }
+        consumed += cw;
+    }
+    result
 }
 
 fn body_color(name: &str) -> String {
