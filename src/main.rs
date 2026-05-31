@@ -791,7 +791,7 @@ impl App {
     // ----- Status bar -----
 
     fn render_status_bar(&mut self) {
-        let keys = "d/D:Day  w/W:Week  m/M:Month  y/Y:Year  e/E:Event  J:Join  N:Note  n:New  g:GoTo  t:Today  i:Import  G:Google  O:Outlook  S:Sync  C:Cal  P:Prefs  ?:Help  q:Quit";
+        let keys = "d/D:Day  w/W:Week  m/M:Month  y/Y:Year  e/E:Event  J:Join  N:Note  p:Pres  n:New  g:GoTo  t:Today  i:Import  G:Google  O:Outlook  S:Sync  C:Cal  P:Prefs  ?:Help  q:Quit";
         let version = format!("tock v{}", env!("CARGO_PKG_VERSION"));
         let w = self.cols as usize;
         if self.syncing {
@@ -1514,6 +1514,7 @@ impl App {
             "F" => self.show_free_busy(),
             "J" => self.join_meeting(),
             "N" => self.open_meeting_note(),
+            "p" => self.open_presentation(),
             "r" => self.reply_via_kastrup(),
             "i" => self.import_ics_file(),
             "G" => self.setup_google_calendar(),
@@ -2448,6 +2449,30 @@ impl App {
         }
     }
 
+    /// `p` (Presentation) — open a Slidev deck for the selected event.
+    ///
+    /// Counterpart to `N` (note). Shells out to `tock-open-deck <event_id>`,
+    /// which reads the event description, finds a `Slides-Slidev/decks/<slug>`
+    /// path (or an http URL), and either launches the slidev dev server +
+    /// browser or opens the URL. Detached spawn so tock stays foreground.
+    fn open_presentation(&mut self) {
+        let evt = match self.event_at_selected_slot() {
+            Some(e) => e,
+            None => { self.show_feedback("No event at this time slot", 245); return; }
+        };
+        let spawned = std::process::Command::new("tock-open-deck")
+            .arg(evt.id.to_string())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        match spawned {
+            Ok(_) => self.show_feedback(&format!("Opening deck: {}", evt.title), 156),
+            Err(e) => self.show_feedback(
+                &format!("tock-open-deck failed: {}", e), 196),
+        }
+    }
+
     fn reply_via_kastrup(&mut self) {
         let evt = match self.event_at_selected_slot() {
             Some(e) => e,
@@ -3185,6 +3210,7 @@ impl App {
         lines.push(format!("  {}        {}", k("v"), d("View event details (scrollable popup)")));
         lines.push(format!("  {}        {}", k("r"), d("Reply via Heathrow")));
         lines.push(format!("  {}        {}", k("J"), d("Join meeting (per-host handler from config, else browser)")));
+        lines.push(format!("  {}        {}", k("p"), d("Open presentation (Slidev deck from event description)")));
         lines.push(sep.clone());
         lines.push(format!("  {}  {}   {}  {}   {}  {}", k("i"), d("Import ICS"), k("G"), d("Google setup"), k("O"), d("Outlook setup")));
         lines.push(format!("  {}  {}     {}  {}      {}  {}", k("S"), d("Sync now"), k("C"), d("Calendars"), k("P"), d("Preferences")));
