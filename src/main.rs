@@ -486,10 +486,7 @@ impl App {
         let slot_start = date_to_ts(sy, sm, sd, hour as u32, minute as u32, 0) - tz;
         let slot_end = slot_start + 1800;
 
-        events.iter().find(|e| {
-            if e.all_day { return false; }
-            e.start_time < slot_end && e.end_time > slot_start
-        }).cloned()
+        pick_timed_event_at_slot(&events, slot_start, slot_end).cloned()
     }
 
     fn select_next_event_on_day(&mut self) {
@@ -3693,9 +3690,70 @@ fn main() {
     Crust::cleanup();
 }
 
+/// Pick which timed event to show for a half-hour slot.
+///
+/// Among the non-all-day events overlapping `[slot_start, slot_end)`, return the
+/// one that started most recently (largest `start_time`). This keeps a multi-day
+/// "background" event — which overlaps every slot of every day it spans — from
+/// shadowing a same-day event that actually starts here.
+fn pick_timed_event_at_slot(events: &[Event], slot_start: i64, slot_end: i64) -> Option<&Event> {
+    events
+        .iter()
+        .filter(|e| !e.all_day && e.start_time < slot_end && e.end_time > slot_start)
+        .max_by_key(|e| e.start_time)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ev(id: i64, start_time: i64, end_time: i64) -> Event {
+        Event {
+            id,
+            calendar_id: 1,
+            external_id: None,
+            title: format!("evt{}", id),
+            description: None,
+            location: None,
+            start_time,
+            end_time,
+            all_day: false,
+            timezone: None,
+            recurrence_rule: None,
+            series_master_id: None,
+            status: "confirmed".into(),
+            organizer: None,
+            attendees: None,
+            my_status: None,
+            alarms: None,
+            metadata: None,
+            calendar_name: "Test".into(),
+            calendar_color: 39,
+        }
+    }
+
+    #[test]
+    fn multiday_event_does_not_shadow_same_day_event() {
+        // #224-style regression: an 11-day "background" reminder (id 1) overlapping
+        // the whole day, plus a same-day 09:00-17:30 course (id 2). Day list is sorted
+        // by start_time like the real one (background first, since it started earlier).
+        let day = 1_781_568_000; // arbitrary midnight-ish epoch for the test day
+        let bg = ev(1, day - 2 * 86400, day + 9 * 86400); // started 2 days before, ends 9 days later
+        let course_start = day + 9 * 3600; // 09:00
+        let course_end = day + 17 * 3600 + 1800; // 17:30
+        let course = ev(2, course_start, course_end);
+        let events = vec![bg, course];
+
+        let pick = |s: i64| pick_timed_event_at_slot(&events, s, s + 1800).map(|e| e.id);
+
+        // Before the course starts (08:00): only the background event overlaps.
+        assert_eq!(pick(day + 8 * 3600), Some(1));
+        // At 09:00 and midday: the same-day course must win over the background.
+        assert_eq!(pick(course_start), Some(2));
+        assert_eq!(pick(day + 14 * 3600), Some(2));
+        // After the course ends (18:00): back to the background event.
+        assert_eq!(pick(day + 18 * 3600), Some(1));
+    }
 
     #[test]
     fn extract_modern_teams_meet() {
