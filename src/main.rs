@@ -133,7 +133,16 @@ struct Quote {
 fn load_quotes(path: &str) -> Vec<Quote> {
     std::fs::read_to_string(path)
         .map(|s| {
-            s.lines()
+            // Skip YAML frontmatter, else `tags:\n  - personal` becomes a
+            // "quote" on the wall.
+            let body = match s.strip_prefix("---") {
+                Some(rest) => match rest.find("\n---") {
+                    Some(i) => &rest[i + 4..],
+                    None => s.as_str(),
+                },
+                None => s.as_str(),
+            };
+            body.lines()
                 .filter_map(|l| l.trim().strip_prefix("- "))
                 .filter_map(|q| {
                     let (en, zh) = match q.split_once('｜') {
@@ -4111,6 +4120,24 @@ mod tests {
             calendar_name: "Test".into(),
             calendar_color: 39,
         }
+    }
+
+    #[test]
+    fn load_quotes_skips_yaml_frontmatter() {
+        let dir = std::env::temp_dir().join("tock_quotes_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("quotes.md");
+        std::fs::write(
+            &f,
+            "---\ncreated: 2026-06-11\ntags:\n  - personal\ntype: area\n---\n\n# 喜歡的話\n\n- Real quote one. — A ｜ 中文\n- Real quote two.\n",
+        )
+        .unwrap();
+        let quotes = load_quotes(f.to_str().unwrap());
+        assert_eq!(quotes.len(), 2);
+        assert_eq!(quotes[0].en, "Real quote one. — A");
+        assert_eq!(quotes[0].zh.as_deref(), Some("中文"));
+        assert_eq!(quotes[1].en, "Real quote two.");
+        let _ = std::fs::remove_file(&f);
     }
 
     #[test]
