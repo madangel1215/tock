@@ -121,6 +121,58 @@ fn today() -> (i32, u32, u32) {
     (y, m, d)
 }
 
+/// Load quotes from a markdown file: every `- ` bullet line is one quote.
+fn load_quotes(path: &str) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .map(|s| {
+            s.lines()
+                .filter_map(|l| l.trim().strip_prefix("- "))
+                .map(|q| q.trim().to_string())
+                .filter(|q| !q.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Greedy display-width wrap, CJK-safe: breaks at spaces when possible,
+/// hard-breaks long unspaced runs (Chinese) per character.
+fn wrap_display(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(4);
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for word in text.split_whitespace() {
+        let ww = display_width(word);
+        if ww <= width {
+            let sep = if cur.is_empty() { 0 } else { 1 };
+            if cur_w + sep + ww > width {
+                lines.push(std::mem::take(&mut cur));
+                cur_w = 0;
+            }
+            if !cur.is_empty() {
+                cur.push(' ');
+                cur_w += 1;
+            }
+            cur.push_str(word);
+            cur_w += ww;
+        } else {
+            for ch in word.chars() {
+                let cw = display_width(&ch.to_string());
+                if cur_w + cw > width {
+                    lines.push(std::mem::take(&mut cur));
+                    cur_w = 0;
+                }
+                cur.push(ch);
+                cur_w += cw;
+            }
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
 fn now_slot() -> i32 {
     let now = database::now_secs();
     let tz_offset = local_tz_offset_secs();
@@ -854,6 +906,44 @@ impl App {
 
         while combined.len() < self.top.h as usize {
             combined.push(String::new());
+        }
+
+        // ----- Quote strip — fills the dead space right of the months -----
+        // Shows one quote from quotes.file (vault note; `- ` bullets),
+        // rotating hourly. Deterministic hash of the hour bucket so every
+        // redraw within the same hour shows the same quote.
+        let quote_x = 1 + months_visible * month_width + 4;
+        let avail = (self.cols as usize).saturating_sub(quote_x + 2);
+        if avail >= 20 {
+            let path = self.config.get_str(
+                "quotes.file",
+                "~/Obsidian/Miles PKM/3 Areas/personal/quotes.md",
+            );
+            let path = if let Some(rest) = path.strip_prefix("~/") {
+                format!("{}/{}", std::env::var("HOME").unwrap_or_default(), rest)
+            } else {
+                path
+            };
+            let quotes = load_quotes(&path);
+            if !quotes.is_empty() {
+                let bucket = (database::now_secs() + local_tz_offset_secs()) / 3600;
+                let idx = ((bucket as u64).wrapping_mul(2654435761) % quotes.len() as u64) as usize;
+                let wrap_w = avail.saturating_sub(2).min(60);
+                let mut qlines = wrap_display(&quotes[idx], wrap_w);
+                qlines.truncate(max_lines.max(1));
+                let start = 1 + max_lines.saturating_sub(qlines.len()) / 2;
+                let quote_fg = self.config.get_i64("quotes.color", 245) as u8;
+                for (i, ql) in qlines.iter().enumerate() {
+                    let row = start + i;
+                    if row >= combined.len() {
+                        break;
+                    }
+                    let pad = quote_x.saturating_sub(display_width(&combined[row]));
+                    let prefix = if i == 0 { "❝ " } else { "  " };
+                    let styled = style::fg(&format!("{}{}", prefix, ql), quote_fg);
+                    combined[row] = format!("{}{}{}", combined[row], " ".repeat(pad), styled);
+                }
+            }
         }
 
         self.top.set_text(&combined.join("\n"));
@@ -3730,6 +3820,19 @@ mod tests {
             calendar_name: "Test".into(),
             calendar_color: 39,
         }
+    }
+
+    #[test]
+    fn wrap_display_breaks_spaces_and_cjk() {
+        // English wraps at word boundaries
+        let lines = wrap_display("Stay hungry. Stay foolish.", 14);
+        assert_eq!(lines, vec!["Stay hungry.", "Stay foolish."]);
+        // Unspaced CJK (double-width) hard-breaks per character without overflow
+        let lines = wrap_display("別斷大於衝量再忙也別歸零", 10);
+        assert!(lines.iter().all(|l| display_width(l) <= 10));
+        assert_eq!(lines.concat(), "別斷大於衝量再忙也別歸零");
+        // Short input stays on one line
+        assert_eq!(wrap_display("hello", 20), vec!["hello"]);
     }
 
     #[test]
