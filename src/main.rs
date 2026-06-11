@@ -142,6 +142,16 @@ fn load_quotes(path: &str) -> Vec<Quote> {
                 },
                 None => s.as_str(),
             };
+            // The note is "docs above, quotes below" — only bullets after the
+            // LAST `---` separator count, so explanatory `- ` lines in the
+            // header don't leak onto the wall. No separator → take them all.
+            let body = match body.lines().enumerate().filter(|(_, l)| l.trim() == "---").last() {
+                Some((idx, _)) => {
+                    let skip: usize = body.lines().take(idx + 1).map(|l| l.len() + 1).sum();
+                    &body[skip.min(body.len())..]
+                }
+                None => body,
+            };
             body.lines()
                 .filter_map(|l| l.trim().strip_prefix("- "))
                 .filter_map(|q| {
@@ -974,10 +984,11 @@ impl App {
         let (sy, sm, sd) = self.selected_date;
         let t = today();
         let month_width = 26usize; // 25 + 1 separator
-        // Show only prev/current/next month (3 strips). Subtract to make
+        // Show only current/next month (2 strips). Subtract to make
         // negative space — Boris-style: don't display info you never use.
-        let months_visible = 3usize;
-        let offset = 1; // Selected (current) month is 2nd, prev=1st, next=3rd
+        // The past is one `M` away; the quote strip gets the freed columns.
+        let months_visible = 2usize;
+        let offset = 0; // Selected (current) month is 1st, next=2nd
 
         let mut month_data: Vec<(i32, u32)> = Vec::new();
         for i in 0..months_visible {
@@ -1065,7 +1076,12 @@ impl App {
                         break;
                     }
                     let pad = quote_x.saturating_sub(display_width(&combined[row]));
-                    combined[row] = format!("{}{}{}", combined[row], " ".repeat(pad), ql);
+                    // bg(0) re-asserts the pane background: the current-month
+                    // block ends with a bg reset, which left the quote (and
+                    // the gap before it) on the terminal default bg — visible
+                    // as an off-colour band behind the text.
+                    let segment = style::bg(&format!("{}{}", " ".repeat(pad), ql), 0);
+                    combined[row] = format!("{}{}", combined[row], segment);
                 }
             }
         }
@@ -4129,7 +4145,7 @@ mod tests {
         let f = dir.join("quotes.md");
         std::fs::write(
             &f,
-            "---\ncreated: 2026-06-11\ntags:\n  - personal\ntype: area\n---\n\n# 喜歡的話\n\n- Real quote one. — A ｜ 中文\n- Real quote two.\n",
+            "---\ncreated: 2026-06-11\ntags:\n  - personal\ntype: area\n---\n\n# 喜歡的話\n\n- 說明文字的 bullet 不該上牆\n- 按 `\"` 開練習框\n\n---\n\n- Real quote one. — A ｜ 中文\n- Real quote two.\n",
         )
         .unwrap();
         let quotes = load_quotes(f.to_str().unwrap());
