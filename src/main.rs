@@ -387,6 +387,9 @@ struct App {
     allday_count: usize,
 
     syncing: bool,
+    // True while the practice popup is open — hides the wall quote so the
+    // answer isn't visible behind the recall exercise.
+    hide_wall_quote: bool,
     poller_rx: mpsc::Receiver<poller::PollerEvent>,
     _poller_tx: mpsc::Sender<poller::PollerEvent>,
 }
@@ -456,6 +459,7 @@ impl App {
             allday_count_date: None,
             allday_count: 0,
             syncing: false,
+            hide_wall_quote: false,
             poller_rx: rx,
             _poller_tx: tx,
         }
@@ -1037,7 +1041,7 @@ impl App {
         // orphan-word wraps); ·N counter = perfect practice runs (`"` key).
         let quote_x = 1 + months_visible * month_width + 4;
         let avail = (self.cols as usize).saturating_sub(quote_x + 2);
-        if avail >= 20 {
+        if avail >= 20 && !self.hide_wall_quote {
             let quotes = load_quotes(&self.quotes_path());
             if !quotes.is_empty() {
                 let q = &quotes[quote_index(quotes.len())];
@@ -3035,9 +3039,11 @@ impl App {
         }
     }
 
-    /// `"` — practice the current wall quote: popup shows the English (+ 中文
-    /// from the ｜ part if present), you type the sentence, ENTER diffs it
-    /// char-by-char against the original. Every attempt is logged to
+    /// `"` — recall-practice the current wall quote: the popup shows the 中文
+    /// as the prompt (plus author + first-word/word-count hint), the English
+    /// stays hidden — type it from memory, ENTER reveals it with a char-level
+    /// diff. The wall quote is hidden while the popup is open so the answer
+    /// isn't sitting on the backdrop. Attempts are logged to
     /// ~/.tock/quote_practice.log; perfect runs feed the wall's ·N counter.
     fn practice_quote(&mut self) {
         let quotes = load_quotes(&self.quotes_path());
@@ -3048,6 +3054,10 @@ impl App {
         let q = &quotes[quote_index(quotes.len())];
         let (body, author) = split_author(&q.en);
         let target: Vec<char> = body.trim().chars().collect();
+
+        // Hide the answer on the backdrop while practicing.
+        self.hide_wall_quote = true;
+        self.render_top_pane();
 
         let pw = (self.cols.saturating_sub(8)).min(90).max(60);
         let ph = self.rows.saturating_sub(6).min(20);
@@ -3095,15 +3105,37 @@ impl App {
             lines.push(String::new());
             lines.push(format!("  {}", style::fg("❝ Practice", 117)));
             lines.push(String::new());
-            for l in wrap_display(body, wrap_w) {
-                lines.push(format!("   {}", style::fg(&l, 250)));
-            }
-            if let Some(a) = author {
-                lines.push(format!("   {}", style::fg(&format!("— {}", a), 242)));
-            }
-            if let Some(ref zh) = q.zh {
-                for l in wrap_display(zh, wrap_w) {
-                    lines.push(format!("   {}", style::fg(&l, 245)));
+            // Recall mode: the 中文 is the prompt; the English stays hidden
+            // until the answer is revealed. Hint = first word + word count.
+            // No 中文 on a quote → nothing to recall from, show the English.
+            match (&q.zh, &result) {
+                (Some(zh), None) => {
+                    for l in wrap_display(zh, wrap_w) {
+                        lines.push(format!("   {}", style::fg(&l, 250)));
+                    }
+                    if let Some(a) = author {
+                        lines.push(format!("   {}", style::fg(&format!("— {}", a), 242)));
+                    }
+                    let n_words = body.split_whitespace().count();
+                    if let Some(first) = body.split_whitespace().next() {
+                        lines.push(format!(
+                            "   {}",
+                            style::fg(&format!("{} …（{} words）", first, n_words), 245)
+                        ));
+                    }
+                }
+                _ => {
+                    for l in wrap_display(body, wrap_w) {
+                        lines.push(format!("   {}", style::fg(&l, 250)));
+                    }
+                    if let Some(a) = author {
+                        lines.push(format!("   {}", style::fg(&format!("— {}", a), 242)));
+                    }
+                    if let Some(ref zh) = q.zh {
+                        for l in wrap_display(zh, wrap_w) {
+                            lines.push(format!("   {}", style::fg(&l, 245)));
+                        }
+                    }
                 }
             }
             let sep_w = (pw as usize).saturating_sub(6).max(1);
@@ -3191,6 +3223,7 @@ impl App {
             }
         }
 
+        self.hide_wall_quote = false;
         Crust::clear_screen();
         self.recreate_panes();
         self.render_all();
