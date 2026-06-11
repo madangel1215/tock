@@ -121,17 +121,118 @@ fn today() -> (i32, u32, u32) {
     (y, m, d)
 }
 
-/// Load quotes from a markdown file: every `- ` bullet line is one quote.
-fn load_quotes(path: &str) -> Vec<String> {
+/// One quote from the quotes file: English text (may end with "— author"),
+/// plus an optional Chinese explanation after a fullwidth ｜ separator.
+struct Quote {
+    en: String,
+    zh: Option<String>,
+}
+
+/// Load quotes from a markdown file: every `- ` bullet line is one quote,
+/// `english — author ｜ 中文解釋` (｜ part optional).
+fn load_quotes(path: &str) -> Vec<Quote> {
     std::fs::read_to_string(path)
         .map(|s| {
             s.lines()
                 .filter_map(|l| l.trim().strip_prefix("- "))
-                .map(|q| q.trim().to_string())
-                .filter(|q| !q.is_empty())
+                .filter_map(|q| {
+                    let (en, zh) = match q.split_once('｜') {
+                        Some((e, z)) => {
+                            let z = z.trim();
+                            (e.trim(), if z.is_empty() { None } else { Some(z.to_string()) })
+                        }
+                        None => (q.trim(), None),
+                    };
+                    if en.is_empty() {
+                        None
+                    } else {
+                        Some(Quote { en: en.to_string(), zh })
+                    }
+                })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Split "quote — author" on the LAST " — " (spaced em dash).
+fn split_author(en: &str) -> (&str, Option<&str>) {
+    match en.rfind(" — ") {
+        Some(i) => (en[..i].trim_end(), Some(en[i + " — ".len()..].trim())),
+        None => (en, None),
+    }
+}
+
+/// Which quote is "current": deterministic hash of the hour bucket, so the
+/// wall and the practice popup agree and redraws within an hour are stable.
+fn quote_index(len: usize) -> usize {
+    let bucket = (database::now_secs() + local_tz_offset_secs()) / 3600;
+    ((bucket as u64).wrapping_mul(2654435761) % len as u64) as usize
+}
+
+fn practice_log_path() -> std::path::PathBuf {
+    config::tock_home().join("quote_practice.log")
+}
+
+/// How many times this quote was typed perfectly (errors == 0).
+fn practice_success_count(en: &str) -> usize {
+    std::fs::read_to_string(practice_log_path())
+        .map(|s| {
+            s.lines()
+                .filter(|l| {
+                    let mut f = l.splitn(4, '\t');
+                    let _ts = f.next();
+                    let ok = f.next() == Some("1");
+                    let _errs = f.next();
+                    ok && f.next() == Some(en)
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn append_practice_log(en: &str, errors: usize) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(practice_log_path())
+    {
+        let ok = if errors == 0 { 1 } else { 0 };
+        let _ = writeln!(f, "{}\t{}\t{}\t{}", database::now_secs(), ok, errors, en);
+    }
+}
+
+/// Char-level LCS diff. Returns (target_hit, typed_ok): false = a target char
+/// the user missed / a typed char that is wrong or extra.
+fn char_diff(target: &[char], typed: &[char]) -> (Vec<bool>, Vec<bool>) {
+    let n = target.len();
+    let m = typed.len();
+    let mut dp = vec![vec![0u32; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i][j] = if target[i] == typed[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+    let mut hit = vec![false; n];
+    let mut ok = vec![false; m];
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if target[i] == typed[j] {
+            hit[i] = true;
+            ok[j] = true;
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    (hit, ok)
 }
 
 /// Greedy display-width wrap, CJK-safe: breaks at spaces when possible,
@@ -910,38 +1011,52 @@ impl App {
 
         // ----- Quote strip — fills the dead space right of the months -----
         // Shows one quote from quotes.file (vault note; `- ` bullets),
-        // rotating hourly. Deterministic hash of the hour bucket so every
-        // redraw within the same hour shows the same quote.
+        // rotating hourly. Author goes on its own dimmed line (also avoids
+        // orphan-word wraps); ·N counter = perfect practice runs (`"` key).
         let quote_x = 1 + months_visible * month_width + 4;
         let avail = (self.cols as usize).saturating_sub(quote_x + 2);
         if avail >= 20 {
-            let path = self.config.get_str(
-                "quotes.file",
-                "~/Obsidian/Miles PKM/3 Areas/personal/quotes.md",
-            );
-            let path = if let Some(rest) = path.strip_prefix("~/") {
-                format!("{}/{}", std::env::var("HOME").unwrap_or_default(), rest)
-            } else {
-                path
-            };
-            let quotes = load_quotes(&path);
+            let quotes = load_quotes(&self.quotes_path());
             if !quotes.is_empty() {
-                let bucket = (database::now_secs() + local_tz_offset_secs()) / 3600;
-                let idx = ((bucket as u64).wrapping_mul(2654435761) % quotes.len() as u64) as usize;
-                let wrap_w = avail.saturating_sub(2).min(60);
-                let mut qlines = wrap_display(&quotes[idx], wrap_w);
+                let q = &quotes[quote_index(quotes.len())];
+                let (body, author) = split_author(&q.en);
+                let wrap_w = avail.saturating_sub(2).min(64);
+                let body_fg = self.config.get_i64("quotes.color", 250) as u8;
+                let mut qlines: Vec<String> = wrap_display(body, wrap_w)
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| {
+                        let mark = if i == 0 {
+                            style::fg("❝ ", 117)
+                        } else {
+                            "  ".to_string()
+                        };
+                        format!("{}{}", mark, style::fg(l, body_fg))
+                    })
+                    .collect();
+                let n = practice_success_count(&q.en);
+                match author {
+                    Some(a) => {
+                        let mut line = format!("  {}", style::fg(&format!("— {}", a), 242));
+                        if n > 0 {
+                            line.push_str(&style::fg(&format!("  ·{}", n), 238));
+                        }
+                        qlines.push(line);
+                    }
+                    None if n > 0 => {
+                        qlines.push(format!("  {}", style::fg(&format!("·{}", n), 238)));
+                    }
+                    None => {}
+                }
                 qlines.truncate(max_lines.max(1));
                 let start = 1 + max_lines.saturating_sub(qlines.len()) / 2;
-                let quote_fg = self.config.get_i64("quotes.color", 245) as u8;
                 for (i, ql) in qlines.iter().enumerate() {
                     let row = start + i;
                     if row >= combined.len() {
                         break;
                     }
                     let pad = quote_x.saturating_sub(display_width(&combined[row]));
-                    let prefix = if i == 0 { "❝ " } else { "  " };
-                    let styled = style::fg(&format!("{}{}", prefix, ql), quote_fg);
-                    combined[row] = format!("{}{}{}", combined[row], " ".repeat(pad), styled);
+                    combined[row] = format!("{}{}{}", combined[row], " ".repeat(pad), ql);
                 }
             }
         }
@@ -1590,6 +1705,7 @@ impl App {
             }
             "g" => self.go_to_date(),
             "/" => self.search_events(),
+            "\"" => self.practice_quote(),
             "n" => self.create_event(),
             "ENTER" => self.edit_event(),
             "x" | "DEL" => self.delete_event(),
@@ -2873,6 +2989,180 @@ impl App {
         self.render_all();
     }
 
+    /// Resolved path of the quotes file (`quotes.file` in config.yml).
+    fn quotes_path(&self) -> String {
+        let path = self.config.get_str(
+            "quotes.file",
+            "~/Obsidian/Miles PKM/3 Areas/personal/quotes.md",
+        );
+        if let Some(rest) = path.strip_prefix("~/") {
+            format!("{}/{}", std::env::var("HOME").unwrap_or_default(), rest)
+        } else {
+            path
+        }
+    }
+
+    /// `"` — practice the current wall quote: popup shows the English (+ 中文
+    /// from the ｜ part if present), you type the sentence, ENTER diffs it
+    /// char-by-char against the original. Every attempt is logged to
+    /// ~/.tock/quote_practice.log; perfect runs feed the wall's ·N counter.
+    fn practice_quote(&mut self) {
+        let quotes = load_quotes(&self.quotes_path());
+        if quotes.is_empty() {
+            self.show_feedback("quotes.md 沒有句子（要 `- ` 開頭的行）", 245);
+            return;
+        }
+        let q = &quotes[quote_index(quotes.len())];
+        let (body, author) = split_author(&q.en);
+        let target: Vec<char> = body.trim().chars().collect();
+
+        let pw = (self.cols.saturating_sub(8)).min(90).max(60);
+        let ph = self.rows.saturating_sub(6).min(20);
+        let px = (self.cols.saturating_sub(pw)) / 2;
+        let py = (self.rows.saturating_sub(ph)) / 2;
+        let mut popup = Pane::new(px, py, pw, ph, 252, 0);
+        popup.border = true;
+        popup.scroll = false;
+
+        let wrap_w = (pw as usize).saturating_sub(8).max(20);
+
+        // Per-char styled render with manual CJK-safe wrapping: good chars in
+        // ok_fg, bad chars (wrong/extra/missed) underlined in bad_fg.
+        let render_marked = |chars: &[char], good: &[bool], ok_fg: u8, bad_fg: u8| -> Vec<String> {
+            let mut lines = Vec::new();
+            let mut cur = String::new();
+            let mut w = 0usize;
+            for (i, &c) in chars.iter().enumerate() {
+                let cw = display_width(&c.to_string());
+                if w + cw > wrap_w {
+                    lines.push(std::mem::take(&mut cur));
+                    w = 0;
+                }
+                let s = c.to_string();
+                if good[i] {
+                    cur.push_str(&style::fg(&s, ok_fg));
+                } else {
+                    cur.push_str(&style::underline(&style::fg(&s, bad_fg)));
+                }
+                w += cw;
+            }
+            if !cur.is_empty() || lines.is_empty() {
+                lines.push(cur);
+            }
+            lines
+        };
+
+        // (errors, target_hit, typed_chars, typed_ok)
+        let mut result: Option<(usize, Vec<bool>, Vec<char>, Vec<bool>)> = None;
+        let mut typed = String::new();
+
+        loop {
+            // ----- render -----
+            let mut lines = Vec::new();
+            lines.push(String::new());
+            lines.push(format!("  {}", style::fg("❝ Practice", 117)));
+            lines.push(String::new());
+            for l in wrap_display(body, wrap_w) {
+                lines.push(format!("   {}", style::fg(&l, 250)));
+            }
+            if let Some(a) = author {
+                lines.push(format!("   {}", style::fg(&format!("— {}", a), 242)));
+            }
+            if let Some(ref zh) = q.zh {
+                for l in wrap_display(zh, wrap_w) {
+                    lines.push(format!("   {}", style::fg(&l, 245)));
+                }
+            }
+            let sep_w = (pw as usize).saturating_sub(6).max(1);
+            lines.push(format!("  {}", style::fg(&"-".repeat(sep_w), 238)));
+
+            match &result {
+                None => {
+                    let all_good = vec![true; typed.chars().count()];
+                    let tchars: Vec<char> = typed.chars().collect();
+                    let mut tlines = render_marked(&tchars, &all_good, 252, 252);
+                    if let Some(last) = tlines.last_mut() {
+                        last.push_str(&style::fg("▏", 51));
+                    }
+                    for (i, l) in tlines.iter().enumerate() {
+                        let prompt = if i == 0 { "> " } else { "  " };
+                        lines.push(format!("  {}{}", style::fg(prompt, 51), l));
+                    }
+                    lines.push(String::new());
+                    lines.push(format!("  {}", style::fg("ENTER:對答案  ESC:離開", 245)));
+                }
+                Some((errors, hit, tchars, ok)) => {
+                    for (i, l) in render_marked(tchars, ok, 252, 203).iter().enumerate() {
+                        let tag = if i == 0 { "你打的 " } else { "       " };
+                        lines.push(format!("  {}{}", style::fg(tag, 245), l));
+                    }
+                    for (i, l) in render_marked(&target, hit, 245, 220).iter().enumerate() {
+                        let tag = if i == 0 { "原句   " } else { "       " };
+                        lines.push(format!("  {}{}", style::fg(tag, 245), l));
+                    }
+                    lines.push(String::new());
+                    if *errors == 0 {
+                        lines.push(format!("  {}", style::fg("✓ 全對！已記一次", 156)));
+                    } else {
+                        lines.push(format!(
+                            "  {}",
+                            style::fg(&format!("✗ {} 處差異（底線標出）", errors), 203)
+                        ));
+                    }
+                    lines.push(String::new());
+                    lines.push(format!("  {}", style::fg("r:再打一次  ENTER/ESC:關閉", 245)));
+                }
+            }
+
+            while lines.len() < (ph as usize).saturating_sub(2) {
+                lines.push(String::new());
+            }
+            popup.full_refresh();
+            popup.set_text(&lines.join("\n"));
+            popup.ix = 0;
+            popup.refresh();
+
+            // ----- input -----
+            let k = Input::getchr(None);
+            match k.as_deref() {
+                Some("ESC") | Some("RESIZE") => break,
+                Some("ENTER") => {
+                    if result.is_some() {
+                        break;
+                    }
+                    let tchars: Vec<char> = typed.trim().chars().collect();
+                    let (hit, ok) = char_diff(&target, &tchars);
+                    let errors = hit.iter().filter(|h| !**h).count()
+                        + ok.iter().filter(|o| !**o).count();
+                    append_practice_log(&q.en, errors);
+                    result = Some((errors, hit, tchars, ok));
+                }
+                Some("BACK") => {
+                    if result.is_none() {
+                        typed.pop();
+                    }
+                }
+                Some("r") if result.is_some() => {
+                    typed.clear();
+                    result = None;
+                }
+                Some(s) => {
+                    if result.is_none() {
+                        let cs: Vec<char> = s.chars().collect();
+                        if cs.len() == 1 && !cs[0].is_control() {
+                            typed.push(cs[0]);
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+
+        Crust::clear_screen();
+        self.recreate_panes();
+        self.render_all();
+    }
+
     /// Spotlight-style live keyword search across events in ±2 year window.
     /// `/` opens, type to narrow, ↑↓ pick, ENTER jumps to event's date, ESC cancels.
     fn search_events(&mut self) {
@@ -3301,6 +3591,7 @@ impl App {
         lines.push(sep.clone());
         lines.push(format!("  {}  {}   {}  {}   {}  {}", k("i"), d("Import ICS"), k("G"), d("Google setup"), k("O"), d("Outlook setup")));
         lines.push(format!("  {}  {}     {}  {}      {}  {}", k("S"), d("Sync now"), k("C"), d("Calendars"), k("P"), d("Preferences")));
+        lines.push(format!("  {}        {}", k("\""), d("Practice the wall quote (type it, get a diff)")));
         lines.push(format!("  {}  {}", k("q"), d("Quit")));
         lines.push(String::new());
         lines.push(format!("  {}", style::fg("Press any key to close...", 245)));
@@ -3820,6 +4111,33 @@ mod tests {
             calendar_name: "Test".into(),
             calendar_color: 39,
         }
+    }
+
+    #[test]
+    fn char_diff_marks_typos_and_misses() {
+        let t: Vec<char> = "stay hungry".chars().collect();
+        // perfect
+        let (hit, ok) = char_diff(&t, &t);
+        assert!(hit.iter().all(|&b| b) && ok.iter().all(|&b| b));
+        // typo: "stey" — 'a' missed in target, 'e' wrong in typed
+        let typed: Vec<char> = "stey hungry".chars().collect();
+        let (hit, ok) = char_diff(&t, &typed);
+        assert_eq!(hit.iter().filter(|h| !**h).count(), 1);
+        assert_eq!(ok.iter().filter(|o| !**o).count(), 1);
+        // empty typed: everything missed, no extras
+        let (hit, ok) = char_diff(&t, &[]);
+        assert!(hit.iter().all(|&b| !b));
+        assert!(ok.is_empty());
+    }
+
+    #[test]
+    fn split_author_on_last_emdash() {
+        let (q, a) = split_author("Stay hungry. — Steve Jobs, Stanford 2005");
+        assert_eq!(q, "Stay hungry.");
+        assert_eq!(a, Some("Steve Jobs, Stanford 2005"));
+        let (q, a) = split_author("別斷 > 衝量。");
+        assert_eq!(q, "別斷 > 衝量。");
+        assert_eq!(a, None);
     }
 
     #[test]
