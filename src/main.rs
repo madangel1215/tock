@@ -162,7 +162,9 @@ fn load_quotes(path: &str) -> Vec<Quote> {
                         }
                         None => (q.trim(), None),
                     };
-                    if en.is_empty() {
+                    // English-practice pool: skip bullets with no English
+                    // letters (純中文句 belongs in the note header, not here).
+                    if en.is_empty() || !en.chars().any(|c| c.is_ascii_alphabetic()) {
                         None
                     } else {
                         Some(Quote { en: en.to_string(), zh })
@@ -1067,6 +1069,12 @@ impl App {
                         qlines.push(format!("  {}", style::fg(&format!("·{}", n), 238)));
                     }
                     None => {}
+                }
+                // Small Chinese gloss under the attribution (dimmest layer).
+                if let Some(ref zh) = q.zh {
+                    for l in wrap_display(zh, wrap_w) {
+                        qlines.push(format!("  {}", style::fg(&l, 245)));
+                    }
                 }
                 qlines.truncate(max_lines.max(1));
                 let start = 1 + max_lines.saturating_sub(qlines.len()) / 2;
@@ -4145,7 +4153,7 @@ mod tests {
         let f = dir.join("quotes.md");
         std::fs::write(
             &f,
-            "---\ncreated: 2026-06-11\ntags:\n  - personal\ntype: area\n---\n\n# 喜歡的話\n\n- 說明文字的 bullet 不該上牆\n- 按 `\"` 開練習框\n\n---\n\n- Real quote one. — A ｜ 中文\n- Real quote two.\n",
+            "---\ncreated: 2026-06-11\ntags:\n  - personal\ntype: area\n---\n\n# 喜歡的話\n\n- 說明文字的 bullet 不該上牆\n- 按 `\"` 開練習框\n\n---\n\n- Real quote one. — A ｜ 中文\n- 純中文句不進英文練習池\n- Real quote two.\n",
         )
         .unwrap();
         let quotes = load_quotes(f.to_str().unwrap());
