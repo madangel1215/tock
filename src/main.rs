@@ -1047,17 +1047,17 @@ impl App {
                 let q = &quotes[quote_index(quotes.len())];
                 let (body, author) = split_author(&q.en);
                 let wrap_w = avail.saturating_sub(2).min(64);
-                let body_fg = self.config.get_i64("quotes.color", 250) as u8;
+                let body_fg = self.config.get_i64("quotes.color", 255) as u8;
                 let mut qlines: Vec<String> = wrap_display(body, wrap_w)
                     .iter()
                     .enumerate()
                     .map(|(i, l)| {
                         let mark = if i == 0 {
-                            style::fg("❝ ", 117)
+                            style::bold(&style::fg("❝ ", 117))
                         } else {
                             "  ".to_string()
                         };
-                        format!("{}{}", mark, style::fg(l, body_fg))
+                        format!("{}{}", mark, style::bold(&style::fg(l, body_fg)))
                     })
                     .collect();
                 let n = practice_success_count(&q.en);
@@ -1082,12 +1082,17 @@ impl App {
                 }
                 qlines.truncate(max_lines.max(1));
                 let start = 1 + max_lines.saturating_sub(qlines.len()) / 2;
+                // Centre the block in the dead space right of the months —
+                // on wide terminals a left-hugging quote disappears into the
+                // void; hanging it mid-wall makes it readable at a glance.
+                let block_w = qlines.iter().map(|l| display_width(l)).max().unwrap_or(0);
+                let block_x = quote_x + avail.saturating_sub(block_w) / 2;
                 for (i, ql) in qlines.iter().enumerate() {
                     let row = start + i;
                     if row >= combined.len() {
                         break;
                     }
-                    let pad = quote_x.saturating_sub(display_width(&combined[row]));
+                    let pad = block_x.saturating_sub(display_width(&combined[row]));
                     // bg(0) re-asserts the pane background: the current-month
                     // block ends with a bg reset, which left the quote (and
                     // the gap before it) on the terminal default bg — visible
