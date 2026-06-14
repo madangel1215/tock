@@ -515,12 +515,13 @@ impl App {
         }
         let (sy, sm, sd) = self.selected_date;
         let wd = cwday(sy, sm, sd);
+        let tz = local_tz_offset_secs();
         let mut max = 0usize;
         for i in 0..7 {
             let offset = i as i32 - (wd as i32 - 1);
             let d = add_days(self.selected_date, offset);
             let n = self.events_by_date.get(&d)
-                .map(|evts| evts.iter().filter(|e| e.all_day).count())
+                .map(|evts| evts.iter().filter(|e| e.all_day || is_background_span(e, tz)).count())
                 .unwrap_or(0);
             if n > max { max = n; }
         }
@@ -621,8 +622,8 @@ impl App {
         // If slot is in all-day area but no event there, jump out
         if self.selected_slot < 0 && self.event_at_selected_slot().is_none() {
             let events = self.events_on_selected_day();
-            if let Some(first_timed) = events.iter().find(|e| !e.all_day) {
-                let tz = local_tz_offset_secs();
+            let tz = local_tz_offset_secs();
+            if let Some(first_timed) = events.iter().find(|e| !e.all_day && !is_background_span(e, tz)) {
                 let local = first_timed.start_time + tz;
                 let (_, _, _, h, m, _) = ts_to_parts(local);
                 self.selected_slot = h as i32 * 2 + if m >= 30 { 1 } else { 0 };
@@ -648,8 +649,9 @@ impl App {
         let events = self.events_on_selected_day();
 
         if self.selected_slot < 0 {
+            let tz = local_tz_offset_secs();
             let ac = self.allday_count();
-            let allday: Vec<&Event> = events.iter().filter(|e| e.all_day).collect();
+            let allday: Vec<&Event> = events.iter().filter(|e| e.all_day || is_background_span(e, tz)).collect();
             let idx = ac as i32 - self.selected_slot.abs();
             if idx >= 0 && (idx as usize) < allday.len() {
                 return Some(allday[idx as usize].clone());
@@ -688,14 +690,14 @@ impl App {
     }
 
     fn move_slot_to_event(&mut self, evt: &Event) {
-        if evt.all_day {
+        let tz = local_tz_offset_secs();
+        if evt.all_day || is_background_span(evt, tz) {
             let ac = self.allday_count();
             let events = self.events_on_selected_day();
-            let allday: Vec<&Event> = events.iter().filter(|e| e.all_day).collect();
+            let allday: Vec<&Event> = events.iter().filter(|e| e.all_day || is_background_span(e, tz)).collect();
             let idx = allday.iter().position(|e| e.id == evt.id).unwrap_or(0);
             self.selected_slot = -(ac as i32 - idx as i32);
         } else {
-            let tz = local_tz_offset_secs();
             let local = evt.start_time + tz;
             let (_, _, _, h, m, _) = ts_to_parts(local);
             self.selected_slot = h as i32 * 2 + if m >= 30 { 1 } else { 0 };
@@ -1291,11 +1293,67 @@ impl App {
         for i in 0..7 {
             let day = add_days(week_start, i);
             let all = self.events_by_date.get(&day).cloned().unwrap_or_default();
-            week_allday.push(all.iter().filter(|e| e.all_day).cloned().collect());
-            week_events.push(all.iter().filter(|e| !e.all_day).cloned().collect());
+            // A multi-day "background span" timed event (e.g. a company reminder
+            // entered as 6/22 10:00 → 6/30 10:30) fills whole columns in the time
+            // grid. Treat it like an all-day event: draw it as a banner bar above
+            // the grid, and keep it OUT of the grid below.
+            week_allday.push(all.iter().filter(|e| e.all_day || is_background_span(e, tz)).cloned().collect());
+            week_events.push(all.iter().filter(|e| !e.all_day && !is_background_span(e, tz)).cloned().collect());
         }
 
-        let max_allday = week_allday.iter().map(|v| v.len()).max().unwrap_or(0);
+        // Banner lane assignment. Both all-day events and multi-day "background
+        // span" timed events (merged into week_allday above) render as horizontal
+        // bars here. Give each a STABLE lane across the whole visible week via
+        // greedy interval colouring, so a bar spanning several days sits on one
+        // row instead of hopping rows per day (which broke run-merging whenever
+        // the banner count differed between columns).
+        struct Banner { evt: Event, first: usize, last: usize }
+        let mut banners: Vec<Banner> = Vec::new();
+        {
+            let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+            for c in 0..7 {
+                for e in &week_allday[c] {
+                    if !seen.insert(e.id) { continue; }
+                    let mut first = c;
+                    let mut last = c;
+                    for (cc, day_evts) in week_allday.iter().enumerate() {
+                        if day_evts.iter().any(|x| x.id == e.id) {
+                            if cc < first { first = cc; }
+                            if cc > last { last = cc; }
+                        }
+                    }
+                    banners.push(Banner { evt: e.clone(), first, last });
+                }
+            }
+        }
+        banners.sort_by(|a, b| a.first.cmp(&b.first)
+            .then(a.evt.start_time.cmp(&b.evt.start_time))
+            .then(a.evt.id.cmp(&b.evt.id)));
+        let mut lanes_last: Vec<i64> = Vec::new(); // highest col occupied per lane
+        let mut lane_of: Vec<usize> = vec![0; banners.len()];
+        for (i, b) in banners.iter().enumerate() {
+            let mut placed = false;
+            for (ln, end) in lanes_last.iter_mut().enumerate() {
+                if (b.first as i64) > *end {
+                    *end = b.last as i64;
+                    lane_of[i] = ln;
+                    placed = true;
+                    break;
+                }
+            }
+            if !placed {
+                lane_of[i] = lanes_last.len();
+                lanes_last.push(b.last as i64);
+            }
+        }
+        let max_allday = lanes_last.len();
+        // lane_cells[lane][col] = Some(banner index) occupying that cell.
+        let mut lane_cells: Vec<[Option<usize>; 7]> = vec![[None; 7]; max_allday];
+        for (i, b) in banners.iter().enumerate() {
+            for c in b.first..=b.last {
+                lane_cells[lane_of[i]][c] = Some(i);
+            }
+        }
         if max_allday > 0 {
             for row in 0..max_allday {
                 let allday_slot = -(max_allday as i32 - row as i32);
@@ -1306,21 +1364,17 @@ impl App {
                     " ".repeat(time_col)
                 };
 
-                // Identify "runs" of consecutive days sharing the same event id.
-                // A multi-day all-day event spans one continuous bar instead of
+                // Runs of consecutive columns sharing the same banner in this
+                // lane — a multi-day bar spans one continuous run instead of
                 // repeating its title across every cell.
+                let cells = &lane_cells[row];
                 let mut runs: Vec<(usize, usize, Option<Event>)> = Vec::new();
                 let mut c = 0usize;
                 while c < 7 {
-                    let cur = week_allday[c].get(row).cloned();
+                    let cur = cells[c].map(|bi| banners[bi].evt.clone());
                     let mut end = c + 1;
-                    if let Some(ref e) = cur {
-                        while end < 7 {
-                            match week_allday[end].get(row) {
-                                Some(n) if n.id == e.id => end += 1,
-                                _ => break,
-                            }
-                        }
+                    if let Some(bi) = cells[c] {
+                        while end < 7 && cells[end] == Some(bi) { end += 1; }
                     }
                     runs.push((c, end - c, cur));
                     c = end;
@@ -4142,16 +4196,33 @@ fn main() {
     Crust::cleanup();
 }
 
+/// A timed event that crosses two or more local midnights (touches ≥3 calendar
+/// days) fully covers the middle day(s), so in the week grid it would fill every
+/// slot of every column it spans — the classic "company entered a reminder as a
+/// multi-day timed event" case (e.g. 6/22 10:00 → 6/30 10:30). Such spans are
+/// lifted OUT of the time grid and drawn as a single banner bar above it, like
+/// all-day events. Overnight events (one midnight crossing) stay in the grid.
+fn is_background_span(evt: &Event, tz: i64) -> bool {
+    if evt.all_day || evt.end_time <= evt.start_time {
+        return false;
+    }
+    let (sy, sm, sd, _, _, _) = ts_to_parts(evt.start_time + tz);
+    let (ey, em, ed, _, _, _) = ts_to_parts((evt.end_time - 1) + tz);
+    day_diff((ey, em, ed), (sy, sm, sd)) >= 2
+}
+
 /// Pick which timed event to show for a half-hour slot.
 ///
 /// Among the non-all-day events overlapping `[slot_start, slot_end)`, return the
-/// one that started most recently (largest `start_time`). This keeps a multi-day
-/// "background" event — which overlaps every slot of every day it spans — from
-/// shadowing a same-day event that actually starts here.
+/// one that started most recently (largest `start_time`). Multi-day background
+/// spans are excluded — they render as banner bars above the grid, not in it, so
+/// a grid slot only ever resolves to an event actually drawn there.
 fn pick_timed_event_at_slot(events: &[Event], slot_start: i64, slot_end: i64) -> Option<&Event> {
+    let tz = local_tz_offset_secs();
     events
         .iter()
-        .filter(|e| !e.all_day && e.start_time < slot_end && e.end_time > slot_start)
+        .filter(|e| !e.all_day && !is_background_span(e, tz)
+            && e.start_time < slot_end && e.end_time > slot_start)
         .max_by_key(|e| e.start_time)
 }
 
@@ -4243,10 +4314,12 @@ mod tests {
     }
 
     #[test]
-    fn multiday_event_does_not_shadow_same_day_event() {
+    fn background_span_excluded_from_grid_picks() {
         // #224-style regression: an 11-day "background" reminder (id 1) overlapping
         // the whole day, plus a same-day 09:00-17:30 course (id 2). Day list is sorted
         // by start_time like the real one (background first, since it started earlier).
+        // The background span is now rendered as a banner bar above the grid, so it
+        // must NEVER be picked from a grid slot — only the same-day course resolves.
         let day = 1_781_568_000; // arbitrary midnight-ish epoch for the test day
         let bg = ev(1, day - 2 * 86400, day + 9 * 86400); // started 2 days before, ends 9 days later
         let course_start = day + 9 * 3600; // 09:00
@@ -4256,13 +4329,28 @@ mod tests {
 
         let pick = |s: i64| pick_timed_event_at_slot(&events, s, s + 1800).map(|e| e.id);
 
-        // Before the course starts (08:00): only the background event overlaps.
-        assert_eq!(pick(day + 8 * 3600), Some(1));
-        // At 09:00 and midday: the same-day course must win over the background.
+        // Outside the course (08:00 / 18:00): the background span is the only
+        // overlap, but it's a banner now — grid resolves to nothing.
+        assert_eq!(pick(day + 8 * 3600), None);
+        assert_eq!(pick(day + 18 * 3600), None);
+        // During the course: the same-day course resolves.
         assert_eq!(pick(course_start), Some(2));
         assert_eq!(pick(day + 14 * 3600), Some(2));
-        // After the course ends (18:00): back to the background event.
-        assert_eq!(pick(day + 18 * 3600), Some(1));
+    }
+
+    #[test]
+    fn is_background_span_classifies_spans_not_overnighters() {
+        let tz = 0; // test in UTC-equivalent terms
+        let day = 1_781_568_000;
+        // 8-day timed reminder (the reported case shape): banner.
+        let long = ev(1, day + 10 * 3600, day + 8 * 86400 + 10 * 3600 + 1800);
+        assert!(is_background_span(&long, tz));
+        // Overnight 18:00 → next-day 09:00 (one midnight): stays in the grid.
+        let overnight = ev(2, day + 18 * 3600, day + 86400 + 9 * 3600);
+        assert!(!is_background_span(&overnight, tz));
+        // Plain same-day meeting: stays in the grid.
+        let meeting = ev(3, day + 9 * 3600, day + 10 * 3600);
+        assert!(!is_background_span(&meeting, tz));
     }
 
     #[test]
