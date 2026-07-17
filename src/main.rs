@@ -89,6 +89,27 @@ fn date_to_ts(year: i32, month: u32, day: u32, hour: u32, min: u32, sec: u32) ->
     days * 86400 + hour as i64 * 3600 + min as i64 * 60 + sec as i64
 }
 
+/// `(start, end)` for an all-day event covering `days` whole days from
+/// `(y,m,d)`. Stored as **UTC midnight** — the convention the renderer
+/// reads (it takes the UTC date of `start_time`). Local-midnight
+/// storage (`date_to_ts - tz`) put the event one offset before UTC
+/// midnight, so its UTC date fell on the previous day and it rendered
+/// on two days. `end` is exclusive (UTC midnight after the last day).
+fn all_day_range(y: i32, m: u32, d: u32, days: i64) -> (i64, i64) {
+    let start = date_to_ts(y, m, d, 0, 0, 0);
+    (start, start + days.max(1) * 86400)
+}
+
+/// Parse `YYYY-MM-DD` → `(y, m, d)`. `None` on malformed input.
+fn parse_ymd(s: &str) -> Option<(i32, u32, u32)> {
+    let p: Vec<&str> = s.trim().split('-').collect();
+    if p.len() != 3 { return None; }
+    let y = p[0].parse::<i32>().ok()?;
+    let m = p[1].parse::<u32>().ok()?;
+    let d = p[2].parse::<u32>().ok()?;
+    if (1..=12).contains(&m) && (1..=31).contains(&d) { Some((y, m, d)) } else { None }
+}
+
 fn ts_to_parts(ts: i64) -> (i32, u32, u32, u32, u32, u32) {
     let secs = ts.rem_euclid(86400);
     let days = ts.div_euclid(86400);
@@ -666,7 +687,24 @@ impl App {
         let slot_start = date_to_ts(sy, sm, sd, hour as u32, minute as u32, 0) - tz;
         let slot_end = slot_start + 1800;
 
-        pick_timed_event_at_slot(&events, slot_start, slot_end).cloned()
+        // Slot-overlap test. Multi-day background spans are excluded — they
+        // render as banner bars above the grid, so a grid slot only ever
+        // resolves to an event actually drawn in it.
+        let overlaps = |e: &Event| !e.all_day && !is_background_span(e, tz)
+            && e.start_time < slot_end && e.end_time > slot_start;
+
+        // When several events share this slot, return the one the user
+        // has cycled to with e/E (selected_event_index) — not always the
+        // first — so every event sharing a slot is reachable for view
+        // and edit. Falls back to the most recently started overlapping
+        // event when the index points elsewhere (e.g. after arrow-key
+        // navigation).
+        if let Some(sel) = events.get(self.selected_event_index) {
+            if overlaps(sel) {
+                return Some(sel.clone());
+            }
+        }
+        events.iter().filter(|e| overlaps(e)).max_by_key(|e| e.start_time).cloned()
     }
 
     fn select_next_event_on_day(&mut self) {
@@ -895,8 +933,15 @@ impl App {
 
         let phase = orbit::moon_phase(sy, sm, sd);
         let moon_color = body_color("moon");
+        // orbit returns the U+1F311–18 emoji moon set; those render
+        // as 2-cell colour icons in most font stacks and pick up a
+        // grey fallback glyph next to them in some terminals — the
+        // "two moons" effect. Use the same text-presentation glyph
+        // tock already uses for the moon body (☾ + VS-15); the phase
+        // name + illumination carry the phase info.
         let moon = format!("  {} {} ({}%)",
-            style::fg_rgb(phase.symbol, &moon_color), phase.phase_name,
+            style::fg_rgb("\u{263E}\u{FE0E}", &moon_color),
+            phase.phase_name,
             (phase.illumination * 100.0).round() as i32);
 
         let lat = self.config.get_f64("location.lat", 59.9139);
@@ -1469,6 +1514,11 @@ impl App {
         if self.slot_offset > max_offset { self.slot_offset = max_offset; }
 
         let end_slot = (self.slot_offset + available).min(48);
+        // Id of the event the user has cycled to (e/E). Lets a slot
+        // shared by several events show the selected one in the grid;
+        // the rest are flagged with a "+N" badge and reachable via e/E.
+        let sel_event_id: Option<i64> = self.events_on_selected_day()
+            .get(self.selected_event_index).map(|e| e.id);
         for slot_idx in self.slot_offset..end_slot {
             let hour = slot_idx / 2;
             let minute = (slot_idx % 2) * 30;
@@ -1499,9 +1549,20 @@ impl App {
                     hour as u32, minute as u32, 0) - tz;
                 let day_ts_end = day_ts_start + 1800;
 
-                let evt_opt = week_events[col as usize].iter().find(|e| {
-                    e.start_time < day_ts_end && e.end_time > day_ts_start
-                });
+                let overlapping: Vec<&Event> = week_events[col as usize].iter()
+                    .filter(|e| e.start_time < day_ts_end && e.end_time > day_ts_start)
+                    .collect();
+                // At the selected day+slot, draw the event the user has
+                // cycled to so events sharing the slot are each reachable;
+                // elsewhere the first.
+                let evt_opt: Option<&Event> = if is_sel && is_slot_selected {
+                    sel_event_id
+                        .and_then(|id| overlapping.iter().find(|e| e.id == id).copied())
+                        .or_else(|| overlapping.first().copied())
+                } else {
+                    overlapping.first().copied()
+                };
+                let extra = overlapping.len().saturating_sub(1);
 
                 let cell = if let Some(evt) = evt_opt {
                     let is_at_slot = is_sel && is_slot_selected;
@@ -1531,6 +1592,13 @@ impl App {
                         title.to_string()
                     } else {
                         format!("{} {}", rsvp, title)
+                    };
+                    // Flag a slot shared by multiple events so the hidden
+                    // ones are discoverable (cycle with e/E). (upstream v0.1.27)
+                    let labeled = if extra > 0 {
+                        format!("{} +{}", labeled, extra)
+                    } else {
+                        labeled
                     };
 
                     // End-time tail only on bottom row, only if the event
@@ -1625,11 +1693,25 @@ impl App {
 
         let evt = self.event_at_selected_slot();
         if let Some(evt) = evt {
+            // Kastrup-style detail: a coloured title, a full-width rule, then
+            // aligned "Label: value" rows (When / Where / Organizer /
+            // Attendees / Calendar / Status / Join), then the human part of
+            // the description with meeting boilerplate stripped out.
             let color = evt.calendar_color as u8;
+            let tz = local_tz_offset_secs();
+            const LBL: u8 = 73;   // field label (teal)
+            const VAL: u8 = 252;  // primary value
+            const DIM: u8 = 245;  // secondary value
+            let label_w = 10;     // pads "Attendees:" so colons align
+            let max_val = w.saturating_sub(label_w + 3);
+            let rule = || style::fg(&"\u{2500}".repeat(w.saturating_sub(1)), 238);
+
+            // Title (bold, calendar colour, RSVP marker prefix)
             let title_only = if evt.title.is_empty() { "(No title)".to_string() } else { evt.title.clone() };
             let rsvp = rsvp_marker(evt.my_status.as_deref());
             let title = if rsvp.is_empty() { title_only } else { format!("{} {}", rsvp, title_only) };
-            let tz = local_tz_offset_secs();
+            lines.push(format!(" {}", style::bold(&style::fg(&truncate_str(&title, w.saturating_sub(2)), color))));
+            lines.push(rule());
 
             // tock-event-counter: show current event's position in the day's
             // event list, e.g. "[3/5]". Suppressed when there's only 1 event.
@@ -1640,58 +1722,52 @@ impl App {
                 _ => String::new(),
             };
 
-            let time_info = if evt.all_day {
+            // When (upstream v0.1.28 detail view) + our [n/N] counter.
+            let when = if evt.all_day {
                 format!("{}-{:02}-{:02}  All day{}", sy, sm, sd, counter)
             } else {
-                let local_s = evt.start_time + tz;
-                let (_, _, _, sh, smn, _) = ts_to_parts(local_s);
-                let local_e = evt.end_time + tz;
-                let (_, _, _, eh, emn, _) = ts_to_parts(local_e);
-                let swd = cwday(sy, sm, sd);
+                let (_, _, _, sh, smn, _) = ts_to_parts(evt.start_time + tz);
+                let (_, _, _, eh, emn, _) = ts_to_parts(evt.end_time + tz);
                 format!("{} {}-{:02}-{:02}  {:02}:{:02} - {:02}:{:02}{}",
-                    weekday_short(swd), sy, sm, sd, sh, smn, eh, emn, counter)
+                    weekday_short(cwday(sy, sm, sd)), sy, sm, sd, sh, smn, eh, emn, counter)
             };
-
-            lines.push(format!(" {}  {}",
-                style::bold(&style::fg(&title, color)),
-                style::fg(&time_info, 252)));
-
-            // Details line
-            let mut details: Vec<String> = Vec::new();
+            if let Some(l) = fmt_field("When", label_w, &when, max_val, LBL, VAL) { lines.push(l); }
             if let Some(ref loc) = evt.location {
-                let loc = loc.trim();
-                if !loc.is_empty() { details.push(format!("Location: {}", loc)); }
+                if let Some(l) = fmt_field("Where", label_w, loc.trim(), max_val, LBL, VAL) { lines.push(l); }
             }
             if let Some(ref org) = evt.organizer {
-                let org = org.trim();
-                if !org.is_empty() { details.push(format!("Organizer: {}", org)); }
+                if let Some(l) = fmt_field("Organizer", label_w, org.trim(), max_val, LBL, DIM) { lines.push(l); }
             }
-            details.push(format!("Calendar: {}", evt.calendar_name));
-            let detail_line = format!(" {}", details.join("  |  "));
-            let detail_line = truncate_str(&detail_line, w.saturating_sub(2));
-            lines.push(style::fg(&detail_line, 245));
+            if let Some(ref att) = evt.attendees {
+                if let Some(line) = attendee_line(att, max_val) {
+                    let lbl = format!("{:<width$}", "Attendees:", width = label_w);
+                    lines.push(format!(" {} {}", style::fg(&lbl, LBL), line));
+                }
+            }
+            if let Some(l) = fmt_field("Calendar", label_w, &evt.calendar_name, max_val, LBL, DIM) { lines.push(l); }
+            // Status: my RSVP, plus the event status unless it's the boring default.
+            let mut st: Vec<String> = Vec::new();
+            if let Some(ref ms) = evt.my_status { st.push(humanize_status(ms).to_string()); }
+            if !evt.status.is_empty() && !evt.status.eq_ignore_ascii_case("confirmed") {
+                st.push(evt.status.clone());
+            }
+            if let Some(l) = fmt_field("Status", label_w, &st.join("  |  "), max_val, LBL, DIM) { lines.push(l); }
+            // Join link extracted from the description (or location).
+            let join = evt.description.as_deref().and_then(extract_meeting_link)
+                .or_else(|| evt.location.as_deref().and_then(extract_meeting_link));
+            if let Some(ref url) = join {
+                let lbl = format!("{:<width$}", "Join:", width = label_w);
+                lines.push(format!(" {} {}", style::fg(&lbl, 40), style::fg(&truncate_str(url, max_val), 39)));
+            }
 
-            // Status
-            let mut status_parts: Vec<String> = Vec::new();
-            if !evt.status.is_empty() {
-                status_parts.push(format!("Status: {}", evt.status));
-            }
-            if let Some(ref ms) = evt.my_status {
-                status_parts.push(format!("My status: {}", humanize_status(ms)));
-            }
-            if !status_parts.is_empty() {
-                lines.push(style::fg(&format!(" {}", status_parts.join("  |  ")), 245));
-            }
-
-            // Description
+            // Description — boilerplate-stripped, word-wrapped to full width.
             if let Some(ref desc) = evt.description {
-                let desc = clean_description(desc);
-                if !desc.is_empty() {
-                    let desc_flat = desc.replace('\n', " ").replace('\r', "");
-                    lines.push(String::new());
-                    let max_lines = 50;
+                let cleaned = clean_meeting_desc(desc);
+                if !cleaned.is_empty() {
+                    lines.push(rule());
+                    let max_lines = self.bottom.h as usize;
                     let mut line = " ".to_string();
-                    for word in desc_flat.split_whitespace() {
+                    for word in cleaned.split_whitespace() {
                         if line.len() + word.len() + 1 > w.saturating_sub(2) {
                             lines.push(style::fg(&line, 248));
                             if lines.len() >= max_lines { break; }
@@ -2057,8 +2133,13 @@ impl App {
         let tz = local_tz_offset_secs();
 
         let (start_ts, end_ts) = if all_day {
-            let s = date_to_ts(sy, sm, sd, 0, 0, 0) - tz;
-            (s, s + 86400)
+            // Multi-day all-day: ask how many whole days it spans.
+            self.blank_bottom(&style::bold(&style::fg(
+                &format!(" {} (all day)", title), cal_color)));
+            let days_str = self.bottom_ask(" Number of days: ", "1");
+            if days_str.is_empty() { self.render_all(); return; }
+            let days: i64 = days_str.trim().parse().unwrap_or(1).max(1);
+            all_day_range(sy, sm, sd, days)
         } else {
             let parts: Vec<&str> = time_str.trim().split(':').collect();
             let hour: u32 = parts.first().and_then(|p| p.parse().ok()).unwrap_or(9);
@@ -2142,27 +2223,100 @@ impl App {
             Some(e) => e,
             None => { self.show_feedback("No event at this time slot", 245); return; }
         };
+        let tz = local_tz_offset_secs();
 
+        // Current date/time of the event for prefills: UTC date for
+        // all-day (matches storage), local wall-clock for timed.
+        let (cy, cm, cd, csh, csmn, _) = if evt.all_day {
+            ts_to_parts(evt.start_time)
+        } else {
+            ts_to_parts(evt.start_time + tz)
+        };
+        let span_secs = (evt.end_time - evt.start_time).max(0);
+
+        // Title
         self.blank_bottom(&style::bold(" Edit Event"));
         let new_title = self.bottom_ask(" Title: ", &evt.title);
-        if new_title.is_empty() { self.render_all(); return; }
+        if new_title.trim().is_empty() { self.render_all(); return; }
+        let new_title = new_title.trim().to_string();
+
+        // Date
+        self.blank_bottom(&style::bold(&format!(" {} — date", new_title)));
+        let date_def = format!("{:04}-{:02}-{:02}", cy, cm, cd);
+        let date_in = self.bottom_ask(" Date (YYYY-MM-DD): ", &date_def);
+        if date_in.is_empty() { self.render_all(); return; }
+        let (dy, dm, dd) = parse_ymd(&date_in).unwrap_or((cy, cm, cd));
+
+        // Time / all-day
+        let time_def = if evt.all_day { "all day".to_string() }
+            else { format!("{:02}:{:02}", csh, csmn) };
+        self.blank_bottom(&style::bold(&format!(" {} — time", new_title)));
+        let time_str = self.bottom_ask(" Start time (HH:MM or 'all day'): ", &time_def);
+        if time_str.is_empty() { self.render_all(); return; }
+        let all_day = time_str.trim().to_lowercase() == "all day";
+
+        let (start_ts, end_ts) = if all_day {
+            let cur_days = (span_secs / 86400).max(1);
+            self.blank_bottom(&style::bold(&format!(" {} (all day)", new_title)));
+            let days_str = self.bottom_ask(" Number of days: ", &cur_days.to_string());
+            let days: i64 = days_str.trim().parse().unwrap_or(cur_days).max(1);
+            all_day_range(dy, dm, dd, days)
+        } else {
+            let parts: Vec<&str> = time_str.trim().split(':').collect();
+            let hour: u32 = parts.first().and_then(|p| p.parse().ok()).unwrap_or(9);
+            let minute: u32 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(0);
+            let s = date_to_ts(dy, dm, dd, hour, minute, 0) - tz;
+            let cur_dur = if evt.all_day || span_secs == 0 { 60 } else { (span_secs / 60).max(1) };
+            self.blank_bottom(&style::bold(&format!(" {} at {}", new_title, time_str.trim())));
+            let dur_str = self.bottom_ask(" Duration in minutes: ", &cur_dur.to_string());
+            let duration: i64 = dur_str.trim().parse().unwrap_or(cur_dur).max(1);
+            (s, s + duration * 60)
+        };
+
+        // Location
+        let loc_def = evt.location.clone().unwrap_or_default();
+        self.blank_bottom(&style::bold(&format!(" {} — location", new_title)));
+        let loc_in = self.bottom_ask(" Location (Enter to skip): ", &loc_def);
+        let location = if loc_in.trim().is_empty() { None } else { Some(loc_in.trim().to_string()) };
+
+        // Invitees (prefill from current attendees' emails)
+        let inv_def = evt.attendees.as_ref()
+            .and_then(|a| a.as_array())
+            .map(|arr| arr.iter()
+                .filter_map(|e| e.get("email").and_then(|v| v.as_str()))
+                .collect::<Vec<_>>().join(", "))
+            .unwrap_or_default();
+        self.blank_bottom(&style::bold(&format!(" {} — invitees", new_title)));
+        let inv_in = self.bottom_ask(" Invite (comma emails, Enter to skip): ", &inv_def);
+        let attendees = if inv_in.trim().is_empty() { None } else {
+            let arr: Vec<serde_json::Value> = inv_in.split(',')
+                .map(|e| serde_json::json!({"email": e.trim()}))
+                .collect();
+            Some(serde_json::Value::Array(arr))
+        };
+
+        // Description
+        let desc_def = evt.description.clone().unwrap_or_default();
+        self.blank_bottom(&style::bold(&format!(" {} — description", new_title)));
+        let desc_in = self.bottom_ask(" Description (Enter to skip): ", &desc_def);
+        let description = if desc_in.trim().is_empty() { None } else { Some(desc_in.trim().to_string()) };
 
         let data = EventData {
             id: Some(evt.id),
             calendar_id: evt.calendar_id,
             external_id: evt.external_id.clone(),
-            title: new_title.trim().to_string(),
-            description: evt.description.clone(),
-            location: evt.location.clone(),
-            start_time: evt.start_time,
-            end_time: evt.end_time,
-            all_day: evt.all_day,
+            title: new_title,
+            description,
+            location,
+            start_time: start_ts,
+            end_time: end_ts,
+            all_day,
             timezone: evt.timezone.clone(),
             recurrence_rule: evt.recurrence_rule.clone(),
             series_master_id: evt.series_master_id,
             status: evt.status.clone(),
             organizer: evt.organizer.clone(),
-            attendees: evt.attendees.clone(),
+            attendees,
             my_status: evt.my_status.clone(),
             alarms: evt.alarms.clone(),
             metadata: evt.metadata.clone(),
@@ -2359,21 +2513,27 @@ impl App {
                     lines.push(String::new());
                     lines.push(format!("  {}", style::fg("Attendees:", 51)));
                     for a in arr {
-                        let name = a.get("name").or(a.get("email")).or(a.get("displayName"))
-                            .and_then(|v| v.as_str()).unwrap_or("?");
-                        let status = a.get("status").or(a.get("responseStatus"))
-                            .and_then(|v| v.as_str()).unwrap_or("");
-                        let status_str = if status.is_empty() { String::new() }
-                            else { style::fg(&format!("  ({})", status), 245) };
-                        lines.push(format!("    {}{}", style::fg(name, 252), status_str));
+                        // attendee_name_status normalises Google/Outlook/manual
+                        // shapes; the RSVP marker (✓/✗/?/·) leads each name.
+                        let Some((name, status)) = attendee_name_status(a) else { continue };
+                        let (marker, mcol) = rsvp_short(&status);
+                        lines.push(format!("    {} {}", style::fg(marker, mcol), style::fg(&name, 252)));
                     }
                 }
             }
         }
 
-        // Description
+        // Join link (extracted from the description / location)
+        let join = evt.description.as_deref().and_then(extract_meeting_link)
+            .or_else(|| evt.location.as_deref().and_then(extract_meeting_link));
+        if let Some(ref url) = join {
+            lines.push(String::new());
+            lines.push(format!("  {} {}", style::fg("Join:", 40), style::fg(url, 39)));
+        }
+
+        // Description (meeting boilerplate stripped — join link is shown above)
         if let Some(ref desc) = evt.description {
-            let desc = clean_description(desc);
+            let desc = clean_meeting_desc(desc);
             if !desc.is_empty() {
                 lines.push(String::new());
                 let sep_w = (pw as usize).saturating_sub(6).max(1);
@@ -2709,12 +2869,25 @@ impl App {
             None => ("xdg-open".to_string(), false),
         };
 
-        let spawned = std::process::Command::new(&launcher)
-            .arg(&url)
+        // GUI launchers like teams-for-linux (Electron) trust
+        // XDG_SESSION_TYPE when picking a display backend. Some
+        // display managers (gdm/sddm on hybrid systems) export
+        // `wayland` even on X11 sessions where WAYLAND_DISPLAY is
+        // unset; the launcher then tries Wayland, fails to connect,
+        // and exits silently — leaving a zombie child behind.
+        // Force the child's session type back to x11 in that case.
+        let mut cmd = std::process::Command::new(&launcher);
+        cmd.arg(&url)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+            .stderr(std::process::Stdio::null());
+        if std::env::var_os("WAYLAND_DISPLAY")
+            .map(|v| v.is_empty()).unwrap_or(true)
+        {
+            cmd.env("XDG_SESSION_TYPE", "x11");
+            cmd.env("ELECTRON_OZONE_PLATFORM_HINT", "x11");
+        }
+        let spawned = cmd.spawn();
         match spawned {
             Ok(_) if !fallback => self.show_feedback(
                 &format!("Joining via {}…", launcher), 156),
@@ -2834,22 +3007,113 @@ impl App {
         self.show_feedback("Google Calendar: see credentials setup documentation", 245);
     }
 
+    /// Outlook device-code auth / re-auth. Microsoft Conditional-Access
+    /// policies cap refresh-token lifetime (e.g. Dualog: 90 days), after
+    /// which sync silently stops with AADSTS70043 — this is how the user
+    /// renews it without leaving the TUI. Existing Outlook calendars are
+    /// re-authenticated in place (their tokens updated); the client_id /
+    /// tenant default to whatever those calendars already use.
+    ///
+    /// Note: `poll_for_token` blocks the UI until the user finishes the
+    /// browser sign-in (or the device code expires). That's acceptable
+    /// for a deliberate, infrequent action.
     fn setup_outlook_calendar(&mut self) {
-        self.blank_bottom(&style::bold(&style::fg(" Outlook/365 Calendar Setup", 33)));
-        let default_client_id = self.config.get_str("outlook.client_id", "");
-        let client_id = self.bottom_ask(" Azure App client_id: ", &default_client_id);
+        self.blank_bottom(&style::bold(&style::fg(" Outlook/365 Calendar Re-auth", 33)));
+
+        // Existing Outlook calendars seed the client_id / tenant so a
+        // re-auth reuses the same Azure app registration.
+        let existing: Vec<crate::database::Calendar> = self.db.get_calendars(false)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| c.source_type == "outlook")
+            .collect();
+        let (def_cid, def_tenant) = existing.first()
+            .and_then(|c| c.source_config.as_deref())
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .map(|cfg| (
+                cfg.get("client_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                cfg.get("tenant_id").and_then(|v| v.as_str()).unwrap_or("common").to_string(),
+            ))
+            .unwrap_or_else(|| (
+                self.config.get_str("outlook.client_id", ""),
+                self.config.get_str("outlook.tenant_id", "common"),
+            ));
+
+        let client_id = self.bottom_ask(" Azure App client_id: ", &def_cid);
         if client_id.trim().is_empty() { self.render_all(); return; }
+        let client_id = client_id.trim().to_string();
+        let tenant_in = self.bottom_ask(
+            &format!(" Tenant ID (Enter for '{}'): ", def_tenant), &def_tenant);
+        let tenant_id = if tenant_in.trim().is_empty() { def_tenant.clone() } else { tenant_in.trim().to_string() };
 
-        let default_tenant = self.config.get_str("outlook.tenant_id", "common");
-        let tenant_id = self.bottom_ask(
-            &format!(" Tenant ID (Enter for '{}'): ", default_tenant), &default_tenant);
-        let tenant_id = if tenant_id.trim().is_empty() { default_tenant } else { tenant_id.trim().to_string() };
-
-        self.config.set("outlook.client_id", serde_yaml::Value::String(client_id.trim().to_string()));
+        self.config.set("outlook.client_id", serde_yaml::Value::String(client_id.clone()));
         self.config.set("outlook.tenant_id", serde_yaml::Value::String(tenant_id.clone()));
         let _ = self.config.save();
 
-        self.show_feedback("Outlook Calendar: device code auth not yet integrated in Tock", 245);
+        // Kick off the device-code flow.
+        let auth_cfg = serde_json::json!({ "client_id": client_id, "tenant_id": tenant_id });
+        let mut oc = sources::outlook::OutlookCalendar::new(&auth_cfg);
+        let dev = match oc.start_device_auth() {
+            Some(v) => v,
+            None => {
+                self.show_feedback(&format!("Device auth failed: {}",
+                    oc.last_error.clone().unwrap_or_default()), 196);
+                self.render_all();
+                return;
+            }
+        };
+        let user_code = dev.get("user_code").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let uri = dev.get("verification_uri").and_then(|v| v.as_str())
+            .unwrap_or("https://microsoft.com/devicelogin").to_string();
+        let device_code = dev.get("device_code").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+        // Show the code + URL, then block on the poll. The bottom line
+        // stays put while the UI is frozen during sign-in.
+        self.blank_bottom(&style::bold(&style::fg(
+            &format!(" Open {}  —  enter code  {}   (signing in… UI waits)", uri, user_code), 46)));
+
+        let tok = match oc.poll_for_token(&device_code) {
+            Some(t) => t,
+            None => {
+                self.show_feedback(&format!("Auth failed/expired: {}",
+                    oc.last_error.clone().unwrap_or_default()), 196);
+                self.render_all();
+                return;
+            }
+        };
+
+        if existing.is_empty() {
+            self.show_feedback(
+                "Authenticated, but no existing Outlook calendar to attach (provision one first).", 220);
+            self.render_all();
+            return;
+        }
+
+        // Re-auth in place: write the fresh tokens into every Outlook
+        // calendar's source_config (keeping client_id / tenant / the
+        // outlook_calendar_id already stored there).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64).unwrap_or(0);
+        let mut updated = 0;
+        for c in &existing {
+            let mut cfg: serde_json::Value = c.source_config.as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            cfg["client_id"] = serde_json::json!(client_id);
+            cfg["tenant_id"] = serde_json::json!(tenant_id);
+            cfg["access_token"] = serde_json::json!(tok.access_token);
+            if let Some(rt) = &tok.refresh_token {
+                cfg["refresh_token"] = serde_json::json!(rt);
+            }
+            let s = serde_json::to_string(&cfg).unwrap_or_default();
+            if self.db.update_calendar_sync(c.id, now, Some(&s)).is_ok() {
+                updated += 1;
+            }
+        }
+        self.show_feedback(
+            &format!("Outlook re-authenticated ({} calendar(s)). Press S to sync.", updated), 46);
+        self.render_all();
     }
 
     fn manual_sync(&mut self) {
@@ -3771,12 +4035,28 @@ impl App {
         if !goto_file.exists() { return; }
         if let Ok(content) = std::fs::read_to_string(&goto_file) {
             let _ = std::fs::remove_file(&goto_file);
+            // kastrup writes goto immediately after dropping an ICS in
+            // ~/.tock/incoming/, so a fresh goto is also the wake
+            // signal that the inbox has something new. Drain incoming
+            // before navigating so the event the user is about to look
+            // at actually exists in the DB. Free piggyback — no new
+            // polling, no new syscalls in the no-goto path (goto stat
+            // is the gate).
+            let cal_id = self.config.get_i64("default_calendar", 1);
+            let imported = ics::watch_incoming(&self.db, cal_id);
+            if imported > 0 { self.load_events_for_range(); }
+
             let content = content.trim().to_string();
-            if content.is_empty() { return; }
+            if content.is_empty() {
+                if imported > 0 { self.render_all(); }
+                return;
+            }
             if let Some(parsed) = self.parse_go_to_input(&content) {
                 self.selected_date = parsed;
                 self.selected_event_index = 0;
                 self.load_events_for_range();
+                self.render_all();
+            } else if imported > 0 {
                 self.render_all();
             }
         }
@@ -3926,6 +4206,119 @@ fn clean_description(desc: &str) -> String {
     let desc = re_box.replace_all(&desc, "");
     let desc = re_blanks.replace_all(&desc, "\n\n");
     desc.trim().to_string()
+}
+
+/// One "Label:    value" detail row, kastrup-style: the label is padded
+/// to `label_w`, coloured `lcol`; the value is colour `vcol`, truncated to
+/// the remaining width. None when the value is blank (so empty fields are
+/// skipped rather than printing a bare label).
+fn fmt_field(label: &str, label_w: usize, value: &str, max_val: usize, lcol: u8, vcol: u8) -> Option<String> {
+    if value.trim().is_empty() { return None; }
+    let lbl = format!("{:<width$}", format!("{}:", label), width = label_w);
+    Some(format!(" {} {}", style::fg(&lbl, lcol), style::fg(&truncate_str(value, max_val), vcol)))
+}
+
+/// Attendee RSVP → (marker, colour). Covers Google (`responseStatus`) and
+/// Outlook (`status.response`) vocabularies.
+fn rsvp_short(status: &str) -> (&'static str, u8) {
+    match status.to_ascii_lowercase().as_str() {
+        "accepted"                            => ("\u{2713}", 40),  // ✓ green
+        "declined"                            => ("\u{2717}", 167), // ✗ red
+        "tentative" | "tentativelyaccepted"   => ("?", 179),        // amber
+        _                                     => ("\u{00B7}", 244), // · grey (no response)
+    }
+}
+
+/// Normalise one attendee object into (display name, raw status), handling
+/// the three shapes tock stores: Outlook `{emailAddress:{address,name},
+/// status:{response}}`, Google `{email,displayName,responseStatus}`, and
+/// the manual `{email}`. Display prefers a real name, else the email's
+/// local part for compactness.
+fn attendee_name_status(a: &serde_json::Value) -> Option<(String, String)> {
+    let (name, email) = match a.get("emailAddress") {
+        Some(ea) => (
+            ea.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            ea.get("address").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        ),
+        None => (
+            a.get("displayName").and_then(|v| v.as_str())
+                .or_else(|| a.get("name").and_then(|v| v.as_str())).unwrap_or("").to_string(),
+            a.get("email").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        ),
+    };
+    let disp = if !name.trim().is_empty() { name.trim().to_string() }
+        else if !email.is_empty() { email.split('@').next().unwrap_or(&email).to_string() }
+        else { return None };
+    let status = a.get("responseStatus").and_then(|v| v.as_str())
+        .or_else(|| a.get("status").and_then(|s| s.get("response")).and_then(|v| v.as_str()))
+        .unwrap_or("").to_string();
+    Some((disp, status))
+}
+
+/// Render the attendee list as `Name ✓  Name ?  …  (total)`, coloured by
+/// RSVP, fitted to `max_w` plain columns (overflow collapses to `+N`).
+fn attendee_line(attendees: &serde_json::Value, max_w: usize) -> Option<String> {
+    let arr = attendees.as_array()?;
+    if arr.is_empty() { return None; }
+    let total = arr.len();
+    let mut parts: Vec<String> = Vec::new();
+    let mut used = 0usize;
+    let mut shown = 0usize;
+    for a in arr {
+        let Some((name, status)) = attendee_name_status(a) else { continue };
+        let (marker, mcol) = rsvp_short(&status);
+        let plain = format!("{} {}", name, marker);
+        if shown > 0 && used + plain.len() + 2 > max_w {
+            parts.push(style::fg(&format!("+{}", total - shown), 245));
+            break;
+        }
+        parts.push(format!("{} {}", style::fg(&name, 250), style::fg(marker, mcol)));
+        used += plain.len() + 2;
+        shown += 1;
+    }
+    if parts.is_empty() { return None; }
+    Some(format!("{}  {}", parts.join("  "), style::fg(&format!("({})", total), 245)))
+}
+
+/// Pull the first video-meeting join URL out of a description/location
+/// (Teams, Zoom, Google Meet, Whereby, Webex). The "Bli med:/Join:" short
+/// link sorts first in Teams invites, so the first match is the clean one.
+fn extract_meeting_link(text: &str) -> Option<String> {
+    let re = regex::Regex::new(
+        r"https://[^\s<>|)\]]*(?:teams\.microsoft\.com/(?:meet|l/meetup-join)|zoom\.us/j/|meet\.google\.com/|whereby\.com/|webex\.com)[^\s<>|)\]]*"
+    ).ok()?;
+    re.find(text).map(|m| m.as_str().trim_end_matches(['>', ')', ']', '.', ',']).to_string())
+}
+
+/// Strip auto-generated meeting boilerplate (the Teams/Zoom join block,
+/// dial-in numbers, passcodes, help links, logo images) so the detail pane
+/// shows only the human-written description. The join URL is surfaced
+/// separately as its own field, so dropping it here is intentional.
+fn clean_meeting_desc(desc: &str) -> String {
+    let base = clean_description(desc);
+    let img_re = regex::Regex::new(r"\[[^\]]*?(?:https?://|\.(?:png|jpg|jpeg|gif|svg))[^\]]*\]").unwrap();
+    const NOISE: &[&str] = &[
+        "teams.microsoft.com", "microsoft teams", "bli med", "join the meeting",
+        "møte-id", "meeting id", "passord", "passcode", "aka.ms", "pexip",
+        "videokonferanse", "video conference", "videokonferanseenhet",
+        "leiers nøkkel", "tenant key", "video-id", "video id",
+        "mer informasjon", "more info", "møtealternativer", "meeting options",
+        "zoom.us", "meet.google.com", "whereby.com", "webex.com",
+        "trenger du hjelp", "need help", "systemreferanse", "for arrangører",
+        "for organizers", "________",
+    ];
+    let mut out: Vec<String> = Vec::new();
+    for raw in base.lines() {
+        let line = img_re.replace_all(raw, "");
+        let l = line.trim();
+        if l.is_empty() { out.push(String::new()); continue; }
+        let low = l.to_lowercase();
+        if NOISE.iter().any(|n| low.contains(n)) { continue; }
+        out.push(l.to_string());
+    }
+    let joined = out.join("\n");
+    let re_blanks = regex::Regex::new(r"\n{2,}").unwrap();
+    re_blanks.replace_all(joined.trim(), "\n").to_string()
 }
 
 fn shellexpand(path: &str) -> String {

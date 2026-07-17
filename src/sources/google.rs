@@ -1,5 +1,8 @@
 // Google Calendar API integration for Tock.
 // Ported from Timely's Ruby implementation; uses ureq for HTTP.
+// Some CRUD / listing entry points are ported ahead of being wired into
+// the TUI; allow the unused surface rather than dropping the integration.
+#![allow(dead_code)]
 
 use crate::database::EventData;
 use serde_json::{json, Value};
@@ -232,12 +235,31 @@ impl GoogleCalendar {
         time_min: &str,
         time_max: &str,
     ) -> Option<Vec<EventData>> {
+        let (events, _) = self.fetch_events_with_cancellations(
+            calendar_id, time_min, time_max
+        )?;
+        Some(events)
+    }
+
+    /// Same as `fetch_events` but also returns the external_ids of
+    /// any events Google has marked `status: "cancelled"` so the
+    /// caller can delete the local rows. We always pass
+    /// `showDeleted=true` — Google filters cancelled events out by
+    /// default and tock would otherwise have no signal that an
+    /// organizer killed a meeting on the attendee's calendar.
+    pub fn fetch_events_with_cancellations(
+        &mut self,
+        calendar_id: &str,
+        time_min: &str,
+        time_max: &str,
+    ) -> Option<(Vec<EventData>, Vec<String>)> {
         let mut all_events: Vec<EventData> = Vec::new();
+        let mut cancelled: Vec<String> = Vec::new();
         let mut page_token: Option<String> = None;
 
         loop {
             let mut path = format!(
-                "/calendar/v3/calendars/{}/events?singleEvents=true&maxResults=250\
+                "/calendar/v3/calendars/{}/events?singleEvents=true&showDeleted=true&maxResults=250\
                  &orderBy=startTime&timeMin={}&timeMax={}",
                 url_encode(calendar_id),
                 url_encode(time_min),
@@ -249,11 +271,22 @@ impl GoogleCalendar {
 
             let json = match self.api_get(&path) {
                 Some(v) => v,
-                None => return if all_events.is_empty() { None } else { Some(all_events) },
+                None => return if all_events.is_empty() && cancelled.is_empty() {
+                    None
+                } else {
+                    Some((all_events, cancelled))
+                },
             };
 
             if let Some(items) = json.get("items").and_then(Value::as_array) {
                 for item in items {
+                    let status = item.get("status").and_then(Value::as_str).unwrap_or("");
+                    if status == "cancelled" {
+                        if let Some(id) = item.get("id").and_then(Value::as_str) {
+                            cancelled.push(id.to_string());
+                        }
+                        continue;
+                    }
                     all_events.push(normalize_event(item, &self.email));
                 }
             }
@@ -266,7 +299,7 @@ impl GoogleCalendar {
             }
         }
 
-        Some(all_events)
+        Some((all_events, cancelled))
     }
 
     /// Incremental sync via Google's `syncToken`.
