@@ -1453,7 +1453,21 @@ impl App {
                         } else {
                             format!("{} {}", rsvp, title)
                         };
-                        let entry = format!("{}{}", marker, truncate_str(&labeled, run_w.saturating_sub(1)));
+                        // Truncate by *display width*, not bytes/chars. truncate_str
+                        // compares s.len() (bytes) but slices with chars().take(n) —
+                        // for CJK that yields ~2x the intended cells, so long titles
+                        // bled into the neighbouring day columns and ran together with
+                        // whatever banner sat next to them. run_w is already the exact
+                        // width this event spans, so a multi-day event still gets all
+                        // the room it occupies; only single-day ones get clipped short.
+                        let avail = run_w.saturating_sub(1);
+                        let labeled_w: usize = labeled.chars().map(char_display_width).sum();
+                        let shown = if labeled_w > avail && avail > 1 {
+                            format!("{}…", slice_by_display(&labeled, 0, avail - 1))
+                        } else {
+                            labeled.clone()
+                        };
+                        let entry = format!("{}{}", marker, shown);
                         let pure_len = display_width(&entry);
                         let pad = run_w.saturating_sub(pure_len);
                         let styled = if let Some(bg) = run_bg {
